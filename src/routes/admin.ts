@@ -20,7 +20,7 @@ import {
   updateApiKeyStatus,
 } from "../repo/apiKeys";
 import { displayKey } from "../utils/crypto";
-import { createAdminSession, deleteAdminSession, verifyAdminSession } from "../repo/adminSessions";
+import { createAdminSession, deleteAdminSession } from "../repo/adminSessions";
 import {
   addTokens,
   applyCooldown,
@@ -74,27 +74,6 @@ function formatBytes(sizeBytes: number): string {
 function normalizeSsoToken(raw: string): string {
   const t = (raw || "").trim();
   return t.startsWith("sso=") ? t.slice(4).trim() : t;
-}
-
-async function tryResetAdminToDefault(args: {
-  env: Env;
-  username?: string | null;
-  password?: string | null;
-  bearer?: string | null;
-}): Promise<boolean> {
-  const wantsResetByLogin =
-    String(args.username ?? "").trim() === "admin" &&
-    String(args.password ?? "").trim() === "admin";
-  const wantsResetByBearer = String(args.bearer ?? "").trim() === "admin";
-  if (!wantsResetByLogin && !wantsResetByBearer) return false;
-
-  await saveSettings(args.env, {
-    global_config: {
-      admin_username: "admin",
-      admin_password: "admin",
-    },
-  });
-  return true;
 }
 
 async function clearKvCacheByType(
@@ -385,16 +364,11 @@ async function proxyToApiAdmin(c: any, apiPath: string): Promise<Response> {
 adminRoutes.post("/api/v1/admin/login", async (c) => {
   try {
     const body = (await c.req.json()) as { username?: string; password?: string };
+    const settings = await getSettings(c.env);
     const username = String(body?.username ?? "").trim();
     const password = String(body?.password ?? "").trim();
-    const reset = await tryResetAdminToDefault({
-      env: c.env,
-      username,
-      password,
-    });
-    const settings = await getSettings(c.env);
 
-    if (!reset && (username !== settings.global.admin_username || password !== settings.global.admin_password)) {
+    if (username !== settings.global.admin_username || password !== settings.global.admin_password) {
       return c.json(legacyErr("Invalid username or password"), 401);
     }
 
@@ -1132,30 +1106,7 @@ adminRoutes.post("/api/v1/admin/cache/online/clear", requireAdminAuth, async (c)
 // Used by upstream static admin UI.
 // ============================================================================
 
-adminRoutes.get("/v1/admin/verify", async (c) => {
-  const token = parseBearer(c.req.header("Authorization") ?? null);
-  if (!token) {
-    return c.json({ error: "缺少会话", code: "MISSING_SESSION" }, 401);
-  }
-
-  const reset = await tryResetAdminToDefault({
-    env: c.env,
-    bearer: token,
-  });
-  if (reset) {
-    return c.json(sourceOk({ verified: true, reset: true }));
-  }
-
-  const settings = await getSettings(c.env);
-  const appKey = String(settings.global.admin_password ?? "").trim();
-  if (appKey && token === appKey) {
-    return c.json(sourceOk({ verified: true }));
-  }
-
-  const sessionOk = await verifyAdminSession(c.env.DB, token);
-  if (!sessionOk) {
-    return c.json({ error: "会话已过期", code: "SESSION_EXPIRED" }, 401);
-  }
+adminRoutes.get("/v1/admin/verify", requireAdminAuth, async (c) => {
   return c.json(sourceOk({ verified: true }));
 });
 
@@ -1476,16 +1427,9 @@ adminRoutes.get("/api/v1/admin/logs/tail", requireAdminAuth, async (c) => {
 adminRoutes.post("/api/login", async (c) => {
   try {
     const body = (await c.req.json()) as { username?: string; password?: string };
-    const username = String(body.username ?? "").trim();
-    const password = String(body.password ?? "").trim();
-    const reset = await tryResetAdminToDefault({
-      env: c.env,
-      username,
-      password,
-    });
     const settings = await getSettings(c.env);
 
-    if (!reset && (username !== settings.global.admin_username || password !== settings.global.admin_password)) {
+    if (body.username !== settings.global.admin_username || body.password !== settings.global.admin_password) {
       return c.json({ success: false, message: "用户名或密码错误" });
     }
 
