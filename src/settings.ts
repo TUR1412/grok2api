@@ -9,8 +9,6 @@ export interface GlobalSettings {
   video_format?: "html" | "url";
   admin_username?: string;
   admin_password?: string;
-  function_enabled?: boolean;
-  function_key?: string;
   disable_memory?: boolean;
   custom_instruction?: string;
   image_cache_max_size_mb?: number;
@@ -124,8 +122,6 @@ const DEFAULTS: SettingsBundle = {
     video_format: "html",
     admin_username: "admin",
     admin_password: "admin",
-    function_enabled: false,
-    function_key: "",
     disable_memory: true,
     custom_instruction: "",
     image_cache_max_size_mb: 512,

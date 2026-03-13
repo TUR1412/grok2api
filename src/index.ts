@@ -3,7 +3,6 @@ import type { Env } from "./env";
 import { openAiRoutes } from "./routes/openai";
 import { mediaRoutes } from "./routes/media";
 import { adminRoutes } from "./routes/admin";
-import { functionRoutes } from "./routes/function";
 import { runKvDailyClear } from "./kv/cleanup";
 
 const app = new Hono<{ Bindings: Env }>();
@@ -83,7 +82,6 @@ app.onError((err, c) => {
 });
 
 app.route("/", adminRoutes);
-app.route("/", functionRoutes);
 app.route("/v1", openAiRoutes);
 app.route("/", mediaRoutes);
 
@@ -104,7 +102,7 @@ app.get("/login", (c) => {
   const buildSha = getBuildSha(c.env as Env);
   const v = c.req.query("v") ?? "";
   if (v !== buildSha) return c.redirect(`/login?v=${encodeURIComponent(buildSha)}`, 302);
-  return fetchAsset(c, "/function/pages/login.html");
+  return fetchAsset(c, "/login/login.html");
 });
 
 app.get("/admin/login", (c) => {
@@ -163,28 +161,7 @@ app.get("/chat", (c) => {
   const buildSha = getBuildSha(c.env as Env);
   const v = c.req.query("v") ?? "";
   if (v !== buildSha) return c.redirect(`/chat?v=${encodeURIComponent(buildSha)}`, 302);
-  return fetchAsset(c, "/function/pages/chat.html");
-});
-
-app.get("/imagine", (c) => {
-  const buildSha = getBuildSha(c.env as Env);
-  const v = c.req.query("v") ?? "";
-  if (v !== buildSha) return c.redirect(`/imagine?v=${encodeURIComponent(buildSha)}`, 302);
-  return fetchAsset(c, "/function/pages/imagine.html");
-});
-
-app.get("/video", (c) => {
-  const buildSha = getBuildSha(c.env as Env);
-  const v = c.req.query("v") ?? "";
-  if (v !== buildSha) return c.redirect(`/video?v=${encodeURIComponent(buildSha)}`, 302);
-  return fetchAsset(c, "/function/pages/video.html");
-});
-
-app.get("/voice", (c) => {
-  const buildSha = getBuildSha(c.env as Env);
-  const v = c.req.query("v") ?? "";
-  if (v !== buildSha) return c.redirect(`/voice?v=${encodeURIComponent(buildSha)}`, 302);
-  return fetchAsset(c, "/function/pages/voice.html");
+  return fetchAsset(c, "/chat/chat.html");
 });
 
 app.get("/admin/chat", (c) => {

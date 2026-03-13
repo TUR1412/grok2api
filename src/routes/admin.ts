@@ -209,8 +209,8 @@ function toSourceConfig(settings: Awaited<ReturnType<typeof getSettings>>): Reco
     app: {
       api_key: settings.grok.api_key ?? "",
       app_key: settings.global.admin_password ?? "admin",
-      function_enabled: Boolean(settings.global.function_enabled),
-      function_key: String(settings.global.function_key ?? ""),
+      function_enabled: false,
+      function_key: "",
       app_url: settings.global.base_url ?? "",
       image_format: settings.global.image_mode ?? "url",
       video_format: settings.global.video_format ?? "html",
@@ -419,14 +419,12 @@ adminRoutes.get("/api/v1/admin/config", requireAdminAuth, async (c) => {
       .filter(Boolean);
     return c.json({
       app: {
-      api_key: settings.grok.api_key ?? "",
-      admin_username: settings.global.admin_username ?? "admin",
-      app_key: settings.global.admin_password ?? "admin",
-      function_enabled: Boolean(settings.global.function_enabled),
-      function_key: String(settings.global.function_key ?? ""),
-      app_url: settings.global.base_url ?? "",
-      image_format: settings.global.image_mode ?? "url",
-      video_format: settings.global.video_format ?? "html",
+        api_key: settings.grok.api_key ?? "",
+        admin_username: settings.global.admin_username ?? "admin",
+        app_key: settings.global.admin_password ?? "admin",
+        app_url: settings.global.base_url ?? "",
+        image_format: settings.global.image_mode ?? "url",
+        video_format: settings.global.video_format ?? "html",
         disable_memory: Boolean(settings.global.disable_memory),
         custom_instruction: String(settings.global.custom_instruction ?? ""),
       },
@@ -539,8 +537,6 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
       if (typeof appCfg.api_key === "string") grok_config.api_key = appCfg.api_key.trim();
       if (typeof appCfg.admin_username === "string") global_config.admin_username = appCfg.admin_username.trim() || "admin";
       if (typeof appCfg.app_key === "string") global_config.admin_password = appCfg.app_key.trim() || "admin";
-      if (typeof appCfg.function_enabled === "boolean") global_config.function_enabled = appCfg.function_enabled;
-      if (typeof appCfg.function_key === "string") global_config.function_key = appCfg.function_key.trim();
       if (typeof appCfg.app_url === "string") global_config.base_url = appCfg.app_url.trim();
       if (appCfg.video_format === "html" || appCfg.video_format === "url") {
         global_config.video_format = appCfg.video_format;
@@ -1200,8 +1196,6 @@ adminRoutes.post("/v1/admin/config", requireAdminAuth, async (c) => {
 
     if (typeof app.api_key === "string") grok_config.api_key = app.api_key.trim();
     if (typeof app.app_key === "string") global_config.admin_password = app.app_key.trim() || "admin";
-    if (typeof app.function_enabled === "boolean") global_config.function_enabled = app.function_enabled;
-    if (typeof app.function_key === "string") global_config.function_key = app.function_key.trim();
     if (typeof app.app_url === "string") global_config.base_url = app.app_url.trim();
     if (typeof app.image_format === "string") global_config.image_mode = app.image_format;
     if (app.video_format === "html" || app.video_format === "url") global_config.video_format = app.video_format;

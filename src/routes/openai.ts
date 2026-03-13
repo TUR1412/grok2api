@@ -34,7 +34,7 @@ import { nowMs } from "../utils/time";
 import { arrayBufferToBase64 } from "../utils/base64";
 import { upsertCacheRow } from "../repo/cache";
 
-export function openAiError(message: string, code: string): Record<string, unknown> {
+function openAiError(message: string, code: string): Record<string, unknown> {
   return { error: { message, type: "invalid_request_error", code } };
 }
 
@@ -463,7 +463,7 @@ async function selectDistinctTokens(
   return chosen;
 }
 
-export async function executeConversationRequest(
+async function executeConversationRequest(
   c: any,
   request: ConversationRequest,
 ): Promise<ConversationOutcome> {
@@ -1829,7 +1829,7 @@ async function recoverImageResults(args: {
   return dedupeImages(recovered).slice(0, Math.max(1, args.desiredCount));
 }
 
-export function streamHeaders(): Record<string, string> {
+function streamHeaders(): Record<string, string> {
   return {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache",
