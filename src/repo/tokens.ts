@@ -147,30 +147,85 @@ export async function getAllTags(db: Env["DB"]): Promise<string[]> {
   return [...set].sort();
 }
 
-export async function selectBestToken(db: Env["DB"], model: string): Promise<{ token: string; token_type: TokenType } | null> {
+export async function refreshCoolingTokens(db: Env["DB"]): Promise<number> {
+  const now = nowMs();
+  const before = await dbFirst<{ c: number }>(
+    db,
+    "SELECT COUNT(1) as c FROM tokens WHERE cooldown_until IS NOT NULL AND cooldown_until <= ?",
+    [now],
+  );
+  await dbRun(
+    db,
+    "UPDATE tokens SET cooldown_until = NULL WHERE cooldown_until IS NOT NULL AND cooldown_until <= ?",
+    [now],
+  );
+  return before?.c ?? 0;
+}
+
+type TokenSelectionOptions = {
+  exclude?: Iterable<string> | undefined;
+  preferTags?: Iterable<string> | undefined;
+  refreshCooling?: boolean | undefined;
+};
+
+function hasPreferredTags(row: TokenRow, preferTags: Set<string>): boolean {
+  if (!preferTags.size) return true;
+  const rowTags = new Set(parseTags(row.tags));
+  for (const tag of preferTags) {
+    if (!rowTags.has(tag)) return false;
+  }
+  return true;
+}
+
+export async function selectBestToken(
+  db: Env["DB"],
+  model: string,
+  options: TokenSelectionOptions = {},
+): Promise<{ token: string; token_type: TokenType } | null> {
   const now = nowMs();
   const isHeavy = model === "grok-4-heavy";
   const field = isHeavy ? "heavy_remaining_queries" : "remaining_queries";
+  const excluded = new Set(Array.from(options.exclude ?? []).map((token) => String(token)));
+  const preferTags = new Set(
+    Array.from(options.preferTags ?? [])
+      .map((tag) => String(tag).trim())
+      .filter(Boolean),
+  );
 
   const pick = async (token_type: TokenType): Promise<{ token: string; token_type: TokenType } | null> => {
-    const row = await dbFirst<{ token: string }>(
+    const rows = await dbAll<TokenRow>(
       db,
-      `SELECT token FROM tokens
+      `SELECT token, token_type, created_time, remaining_queries, heavy_remaining_queries, status, tags, note, cooldown_until, last_failure_time, last_failure_reason, failed_count FROM tokens
        WHERE token_type = ?
          AND status != 'expired'
          AND failed_count < ?
          AND (cooldown_until IS NULL OR cooldown_until <= ?)
          AND ${field} != 0
        ORDER BY CASE WHEN ${field} = -1 THEN 0 ELSE 1 END, ${field} DESC, created_time ASC
-       LIMIT 1`,
+      `,
       [token_type, MAX_FAILURES, now],
     );
-    return row ? { token: row.token, token_type } : null;
+
+    const available = rows.filter((row) => !excluded.has(row.token));
+    const preferred = preferTags.size
+      ? available.filter((row) => hasPreferredTags(row, preferTags))
+      : available;
+    const chosen = (preferred.length ? preferred : available)[0];
+    return chosen ? { token: chosen.token, token_type } : null;
   };
 
-  if (isHeavy) return pick("ssoSuper");
+  let selected = isHeavy
+    ? await pick("ssoSuper")
+    : (await pick("sso")) ?? (await pick("ssoSuper"));
 
-  return (await pick("sso")) ?? (await pick("ssoSuper"));
+  if (!selected && options.refreshCooling) {
+    await refreshCoolingTokens(db);
+    selected = isHeavy
+      ? await pick("ssoSuper")
+      : (await pick("sso")) ?? (await pick("ssoSuper"));
+  }
+
+  return selected;
 }
 
 export async function recordTokenFailure(

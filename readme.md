@@ -238,6 +238,18 @@ curl http://localhost:8000/v1/chat/completions \
 
 </details>
 
+### `POST /v1/responses`
+
+> OpenAI Responses API 兼容接口，支持 `stream`、`tools`、`tool_choice`、`parallel_tool_calls`
+
+<br>
+
+### `POST /v1/videos`
+
+> OpenAI-compatible 视频创建接口，映射到 `grok-imagine-1.0-video`
+
+<br>
+
 ### `POST /v1/images/generations`
 
 > 图像生成接口

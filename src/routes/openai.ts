@@ -2,13 +2,21 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import type { Env } from "../env";
 import { requireApiAuth } from "../auth";
-import { getSettings, normalizeCfCookie } from "../settings";
+import { getSettings } from "../settings";
 import { isValidModel, MODEL_CONFIG } from "../grok/models";
 import { extractContent, buildConversationPayload, sendConversationRequest } from "../grok/conversation";
 import { uploadImage } from "../grok/upload";
-import { getDynamicHeaders } from "../grok/headers";
+import { buildAuthCookie, getDynamicHeaders } from "../grok/headers";
 import { createMediaPost, createPost } from "../grok/create";
 import { createOpenAiStreamFromGrokNdjson, parseOpenAiFromGrokNdjson } from "../grok/processor";
+import {
+  buildResponseObject,
+  coerceInputToMessages,
+  createResponsesStreamFromOpenAiStream,
+  normalizeToolChoice,
+  normalizeToolsForChat,
+} from "../grok/responses";
+import type { OpenAIToolCall } from "../grok/toolCall";
 import {
   IMAGE_METHOD_IMAGINE_WS_EXPERIMENTAL,
   generateImagineWs,
@@ -17,7 +25,7 @@ import {
   sendExperimentalImageEditRequest,
 } from "../grok/imagineExperimental";
 import { addRequestLog } from "../repo/logs";
-import { applyCooldown, recordTokenFailure, selectBestToken } from "../repo/tokens";
+import { applyCooldown, recordTokenFailure, refreshCoolingTokens, selectBestToken } from "../repo/tokens";
 import type { ApiAuthInfo } from "../auth";
 import { getApiKeyLimits } from "../repo/apiKeys";
 import { localDayString, tryConsumeDailyUsage, tryConsumeDailyUsageMulti } from "../repo/apiKeyUsage";
@@ -78,6 +86,21 @@ async function runTasksSettledWithLimit<T, R>(
   });
   await Promise.all(workers);
   return results;
+}
+
+function sleepMsRaw(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function readWithTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  ms: number,
+): Promise<ReadableStreamReadResult<Uint8Array> | { timeout: true }> {
+  if (ms <= 0) return { timeout: true };
+  return Promise.race([
+    reader.read(),
+    sleepMsRaw(ms).then(() => ({ timeout: true }) as const),
+  ]);
 }
 
 export const openAiRoutes = new Hono<{ Bindings: Env; Variables: { apiAuth: ApiAuthInfo } }>();
@@ -212,6 +235,13 @@ function toProxyUrl(baseUrl: string, path: string): string {
 }
 
 type ImageResponseFormat = "url" | "base64" | "b64_json";
+type ImageStage = "preview" | "medium" | "final";
+type ClassifiedImageAsset = {
+  rawUrl: string;
+  value: string;
+  blobSize: number;
+  stage: ImageStage;
+};
 
 function resolveResponseFormat(raw: unknown, defaultMode: string): ImageResponseFormat | null {
   const fallback = String(defaultMode || "url").trim().toLowerCase();
@@ -270,6 +300,358 @@ function pickImageResults(images: string[], n: number): string[] {
   return picked;
 }
 
+const ALLOWED_REASONING_EFFORTS = new Set([
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+]);
+
+type ConversationOutcome =
+  | { errorResponse: Response }
+  | { stream: ReadableStream<Uint8Array> }
+  | { json: Record<string, unknown> };
+
+type ConversationRequest = {
+  model: string;
+  messages: any[];
+  stream?: boolean | undefined;
+  videoConfig?: {
+    aspect_ratio?: string;
+    video_length?: number;
+    resolution?: string;
+    preset?: string;
+  } | undefined;
+  temperature?: number | undefined;
+  topP?: number | undefined;
+  tools?: Array<Record<string, any>> | null | undefined;
+  toolChoice?: unknown;
+  parallelToolCalls?: boolean | undefined;
+  reasoningEffort?: string | null | undefined;
+};
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function jsonResponse(body: Record<string, unknown>, status: number): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+}
+
+function validateReasoningEffort(reasoningEffort: unknown): string | null {
+  if (reasoningEffort == null) return null;
+  if (typeof reasoningEffort !== "string" || !ALLOWED_REASONING_EFFORTS.has(reasoningEffort)) {
+    return `reasoning_effort must be one of ${JSON.stringify(Array.from(ALLOWED_REASONING_EFFORTS))}`;
+  }
+  return null;
+}
+
+function validateTools(
+  tools: unknown,
+  opts: { allowBuiltins?: boolean } = {},
+): string | null {
+  if (tools == null) return null;
+  if (!Array.isArray(tools)) return "tools must be an array";
+  for (let index = 0; index < tools.length; index += 1) {
+    const tool = tools[index];
+    if (!tool || typeof tool !== "object") {
+      return `tools.${index} must be an object`;
+    }
+    const record = tool as Record<string, any>;
+    if (record.type === "function") {
+      const name = record.function?.name;
+      if (typeof name !== "string" || !name.trim()) {
+        return `tools.${index}.function.name is required`;
+      }
+      continue;
+    }
+    if (opts.allowBuiltins) continue;
+    return `tools.${index}.type must be "function"`;
+  }
+  return null;
+}
+
+function validateToolChoice(toolChoice: unknown): string | null {
+  if (toolChoice == null) return null;
+  if (typeof toolChoice === "string") {
+    if (toolChoice === "auto" || toolChoice === "required" || toolChoice === "none") {
+      return null;
+    }
+    return "tool_choice must be 'auto', 'required', 'none', or a specific function object";
+  }
+  if (toolChoice && typeof toolChoice === "object" && !Array.isArray(toolChoice)) {
+    const record = toolChoice as Record<string, any>;
+    if (record.type === "function" && typeof record.function?.name === "string" && record.function.name.trim()) {
+      return null;
+    }
+  }
+  return "tool_choice object must have type='function' and function.name";
+}
+
+function computeRetryDelayMs(
+  settings: Awaited<ReturnType<typeof getSettings>>["grok"],
+  attempt: number,
+  startedAtMs: number,
+): number | null {
+  const baseSeconds = Number(settings.retry_backoff_base ?? 0.5);
+  const factor = Number(settings.retry_backoff_factor ?? 2);
+  const maxSeconds = Number(settings.retry_backoff_max ?? 20);
+  const budgetSeconds = Number(settings.retry_budget ?? 60);
+
+  const cappedSeconds = Math.min(
+    Math.max(0, maxSeconds),
+    Math.max(0, baseSeconds) * Math.pow(Math.max(1, factor), attempt),
+  );
+  const remainingBudgetMs = Math.max(0, Math.floor(budgetSeconds * 1000) - (Date.now() - startedAtMs));
+  if (remainingBudgetMs <= 0) return null;
+  return Math.min(Math.floor(cappedSeconds * 1000), remainingBudgetMs);
+}
+
+function isTransientUpstreamStatus(status: number): boolean {
+  return status === 408 || status === 409 || status === 425 || status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+function preferredImageTags(settingsBundle: Awaited<ReturnType<typeof getSettings>>): string[] | undefined {
+  return settingsBundle.image.nsfw ? ["nsfw"] : undefined;
+}
+
+async function selectPreferredToken(
+  db: Env["DB"],
+  model: string,
+  options: {
+    exclude?: Iterable<string> | undefined;
+    preferTags?: Iterable<string> | undefined;
+    refreshCooling?: boolean | undefined;
+  } = {},
+): Promise<{ token: string; token_type: "sso" | "ssoSuper" } | null> {
+  return selectBestToken(db, model, {
+    exclude: options.exclude,
+    preferTags: options.preferTags,
+    refreshCooling: options.refreshCooling ?? true,
+  });
+}
+
+async function selectDistinctTokens(
+  db: Env["DB"],
+  model: string,
+  count: number,
+  options: {
+    exclude?: Iterable<string> | undefined;
+    preferTags?: Iterable<string> | undefined;
+  } = {},
+): Promise<Array<{ token: string; token_type: "sso" | "ssoSuper" }>> {
+  const chosen: Array<{ token: string; token_type: "sso" | "ssoSuper" }> = [];
+  const excluded = new Set(Array.from(options.exclude ?? []).map((token) => String(token)));
+  const total = Math.max(0, Math.floor(count));
+
+  for (let index = 0; index < total; index += 1) {
+    const token = await selectPreferredToken(db, model, {
+      exclude: excluded,
+      preferTags: options.preferTags,
+      refreshCooling: index === 0,
+    });
+    if (!token) break;
+    chosen.push(token);
+    excluded.add(token.token);
+  }
+
+  return chosen;
+}
+
+async function executeConversationRequest(
+  c: any,
+  request: ConversationRequest,
+): Promise<ConversationOutcome> {
+  const start = Date.now();
+  const ip = getClientIp(c.req.raw);
+  const keyName = c.get("apiAuth").name ?? "Unknown";
+  const origin = new URL(c.req.url).origin;
+
+  const requestedModel = request.model;
+  const settingsBundle = await getSettings(c.env);
+  const cfg = MODEL_CONFIG[requestedModel]!;
+  const retryCodes = Array.isArray(settingsBundle.grok.retry_status_codes)
+    ? settingsBundle.grok.retry_status_codes
+    : [401, 429, 403];
+  const maxRetry = Math.max(1, Math.floor(Number(settingsBundle.grok.max_retry ?? 3) || 3));
+
+  const quotaKind = cfg.is_video_model ? "video" : cfg.is_image_model ? "image" : "chat";
+  const quota = await enforceQuota({
+    env: c.env,
+    apiAuth: c.get("apiAuth"),
+    model: requestedModel,
+    kind: quotaKind as any,
+    ...(cfg.is_image_model ? { imageCount: 2 } : {}),
+  });
+  if (!quota.ok) {
+    return { errorResponse: quota.resp };
+  }
+
+  let lastErr: string | null = null;
+
+  for (let attempt = 0; attempt < maxRetry; attempt += 1) {
+    const chosen = await selectPreferredToken(c.env.DB, requestedModel, {
+      refreshCooling: attempt === 0,
+    });
+    if (!chosen) {
+      return {
+        errorResponse: jsonResponse(
+          openAiError("No available token", "NO_AVAILABLE_TOKEN"),
+          503,
+        ),
+      };
+    }
+
+    const jwt = chosen.token;
+    const cookie = buildAuthCookie(jwt, settingsBundle.grok);
+
+    const { content, images } = extractContent(request.messages as any);
+    const isVideoModel = Boolean(cfg.is_video_model);
+    const imageInputs = isVideoModel && images.length > 1 ? images.slice(0, 1) : images;
+
+    try {
+      const uploads = await mapLimit(imageInputs, resolveAssetsConcurrency(settingsBundle, 5), (imageUrl) =>
+        uploadImage(imageUrl, cookie, settingsBundle.grok),
+      );
+      const imgIds = uploads.map((item) => item.fileId).filter(Boolean);
+      const imgUris = uploads.map((item) => item.fileUri).filter(Boolean);
+
+      let postId: string | undefined;
+      if (isVideoModel) {
+        if (imgUris.length) {
+          const post = await createPost(imgUris[0]!, cookie, settingsBundle.grok);
+          postId = post.postId || undefined;
+        } else {
+          const post = await createMediaPost(
+            { mediaType: "MEDIA_POST_TYPE_VIDEO", prompt: content },
+            cookie,
+            settingsBundle.grok,
+          );
+          postId = post.postId || undefined;
+        }
+      }
+
+      const { payload, referer } = buildConversationPayload({
+        requestModel: requestedModel,
+        content,
+        imgIds,
+        imgUris,
+        ...(postId ? { postId } : {}),
+        ...(isVideoModel && request.videoConfig ? { videoConfig: request.videoConfig } : {}),
+        settings: settingsBundle.grok,
+        globalSettings: settingsBundle.global,
+        temperature: request.temperature,
+        topP: request.topP,
+        reasoningEffort: request.reasoningEffort,
+        tools: request.tools,
+        toolChoice: request.toolChoice,
+        parallelToolCalls: request.parallelToolCalls,
+      });
+
+      const upstream = await sendConversationRequest({
+        payload,
+        cookie,
+        settings: settingsBundle.grok,
+        ...(referer ? { referer } : {}),
+      });
+
+      if (!upstream.ok) {
+        const txt = await upstream.text().catch(() => "");
+        lastErr = `Upstream ${upstream.status}: ${txt.slice(0, 200)}`;
+        await recordTokenFailure(c.env.DB, jwt, upstream.status, txt.slice(0, 200));
+        await applyCooldown(c.env.DB, jwt, upstream.status);
+        if ((retryCodes.includes(upstream.status) || isTransientUpstreamStatus(upstream.status)) && attempt < maxRetry - 1) {
+          const retryDelayMs = computeRetryDelayMs(settingsBundle.grok, attempt, start);
+          if (retryDelayMs == null) break;
+          if (retryDelayMs > 0) await sleepMs(retryDelayMs);
+          continue;
+        }
+        break;
+      }
+
+      if (request.stream) {
+        const stream = createOpenAiStreamFromGrokNdjson(upstream, {
+          cookie,
+          settings: settingsBundle.grok,
+          global: settingsBundle.global,
+          origin,
+          requestedModel,
+          tools: request.tools,
+          onFinish: async ({ status, duration }) => {
+            await addRequestLog(c.env.DB, {
+              ip,
+              model: requestedModel,
+              duration: Number(duration.toFixed(2)),
+              status,
+              key_name: keyName,
+              token_suffix: jwt.slice(-6),
+              error: status === 200 ? "" : "stream_error",
+            });
+          },
+        });
+        return { stream };
+      }
+
+      const json = await parseOpenAiFromGrokNdjson(upstream, {
+        cookie,
+        settings: settingsBundle.grok,
+        global: settingsBundle.global,
+        origin,
+        requestedModel,
+        tools: request.tools,
+      });
+
+      const duration = (Date.now() - start) / 1000;
+      await addRequestLog(c.env.DB, {
+        ip,
+        model: requestedModel,
+        duration: Number(duration.toFixed(2)),
+        status: 200,
+        key_name: keyName,
+        token_suffix: jwt.slice(-6),
+        error: "",
+      });
+
+      return { json };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      lastErr = message;
+      await recordTokenFailure(c.env.DB, jwt, 500, message);
+      await applyCooldown(c.env.DB, jwt, 500);
+
+      if (attempt < maxRetry - 1) {
+        const retryDelayMs = computeRetryDelayMs(settingsBundle.grok, attempt, start);
+        if (retryDelayMs == null) break;
+        if (retryDelayMs > 0) await sleepMs(retryDelayMs);
+        continue;
+      }
+    }
+  }
+
+  const duration = (Date.now() - start) / 1000;
+  await addRequestLog(c.env.DB, {
+    ip,
+    model: requestedModel,
+    duration: Number(duration.toFixed(2)),
+    status: 500,
+    key_name: keyName,
+    token_suffix: "",
+    error: lastErr ?? "unknown_error",
+  });
+
+  return {
+    errorResponse: jsonResponse(
+      openAiError(lastErr ?? "Upstream error", "upstream_error"),
+      500,
+    ),
+  };
+}
+
 function normalizeImageMime(mime: string): string {
   const m = (mime || "").trim().toLowerCase();
   if (m === "image/jpg") return "image/jpeg";
@@ -289,6 +671,15 @@ async function fetchImageAsBase64(args: {
   cookie: string;
   settings: Awaited<ReturnType<typeof getSettings>>["grok"];
 }): Promise<string> {
+  const asset = await fetchImageAsset(args);
+  return arrayBufferToBase64(asset.bytes);
+}
+
+async function fetchImageAsset(args: {
+  rawUrl: string;
+  cookie: string;
+  settings: Awaited<ReturnType<typeof getSettings>>["grok"];
+}): Promise<{ bytes: ArrayBuffer; byteLength: number }> {
   let url: URL;
   try {
     url = new URL(args.rawUrl);
@@ -311,7 +702,81 @@ async function fetchImageAsBase64(args: {
     const txt = await resp.text().catch(() => "");
     throw new Error(`Image download failed: ${resp.status} ${txt.slice(0, 200)}`);
   }
-  return arrayBufferToBase64(await resp.arrayBuffer());
+  const bytes = await resp.arrayBuffer();
+  return { bytes, byteLength: bytes.byteLength };
+}
+
+function classifyImageStage(
+  byteLength: number,
+  imageSettings: Awaited<ReturnType<typeof getSettings>>["image"],
+): ImageStage {
+  const finalMinBytes = Math.max(1, Math.floor(Number(imageSettings.final_min_bytes ?? 100_000)));
+  const mediumMinBytes = Math.max(1, Math.floor(Number(imageSettings.medium_min_bytes ?? 30_000)));
+  if (byteLength >= finalMinBytes) return "final";
+  if (byteLength > mediumMinBytes) return "medium";
+  return "preview";
+}
+
+async function classifyRawUrlByFormat(
+  rawUrl: string,
+  responseFormat: ImageResponseFormat,
+  args: {
+    baseUrl: string;
+    cookie: string;
+    settings: Awaited<ReturnType<typeof getSettings>>["grok"];
+    imageSettings: Awaited<ReturnType<typeof getSettings>>["image"];
+  },
+): Promise<ClassifiedImageAsset> {
+  const asset = await fetchImageAsset({
+    rawUrl,
+    cookie: args.cookie,
+    settings: args.settings,
+  });
+  const value = responseFormat === "url"
+    ? toProxyUrl(args.baseUrl, encodeAssetPath(rawUrl))
+    : arrayBufferToBase64(asset.bytes);
+  return {
+    rawUrl,
+    value,
+    blobSize: asset.byteLength,
+    stage: classifyImageStage(asset.byteLength, args.imageSettings),
+  };
+}
+
+async function classifyRawUrlsByFormat(
+  rawUrls: string[],
+  responseFormat: ImageResponseFormat,
+  args: {
+    settingsBundle: Awaited<ReturnType<typeof getSettings>>;
+    baseUrl: string;
+    cookie: string;
+  },
+): Promise<ClassifiedImageAsset[]> {
+  const dedupedRawUrls = dedupeImages(rawUrls);
+  return mapLimit(
+    dedupedRawUrls,
+    resolveAssetsConcurrency(args.settingsBundle, dedupedRawUrls.length || 1),
+    async (rawUrl) =>
+      classifyRawUrlByFormat(rawUrl, responseFormat, {
+        baseUrl: args.baseUrl,
+        cookie: args.cookie,
+        settings: args.settingsBundle.grok,
+        imageSettings: args.settingsBundle.image,
+      }),
+  );
+}
+
+function finalImageValues(classified: ClassifiedImageAsset[]): string[] {
+  return dedupeImages(
+    classified
+      .filter((item) => item.stage === "final")
+      .map((item) => item.value)
+      .filter(Boolean),
+  );
+}
+
+function sawIntermediateImages(classified: ClassifiedImageAsset[]): boolean {
+  return classified.some((item) => item.stage === "medium" || item.stage === "preview");
 }
 
 async function convertRawUrlByFormat(
@@ -355,11 +820,13 @@ function buildImageSse(event: string, data: Record<string, unknown>): string {
 
 function createImageEventStream(args: {
   upstream: Response;
+  settingsBundle: Awaited<ReturnType<typeof getSettings>>;
   responseFormat: ImageResponseFormat;
   baseUrl: string;
   cookie: string;
   settings: Awaited<ReturnType<typeof getSettings>>["grok"];
   n: number;
+  recovery?: (() => Promise<string[]>) | undefined;
   onFinish?: (result: { status: number; duration: number }) => Promise<void> | void;
 }): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
@@ -370,6 +837,27 @@ function createImageEventStream(args: {
   return new ReadableStream<Uint8Array>({
     async start(controller) {
       const startedAt = Date.now();
+      const streamTimeoutMs = Math.max(
+        1_000,
+        Math.floor(
+          Number(
+            args.settingsBundle.image.stream_timeout ??
+              args.settingsBundle.image.timeout ??
+              60,
+          ) * 1000,
+        ),
+      );
+      const finalTimeoutMs = Math.max(
+        1_000,
+        Math.floor(Number(args.settingsBundle.image.final_timeout ?? 15) * 1000),
+      );
+      const blockedGraceMs = Math.max(
+        1_000,
+        Math.min(
+          finalTimeoutMs,
+          Math.floor(Number(args.settingsBundle.image.blocked_grace_seconds ?? 10) * 1000),
+        ),
+      );
       const body = args.upstream.body;
       if (!body) {
         if (args.onFinish) {
@@ -381,13 +869,34 @@ function createImageEventStream(args: {
 
       const reader = body.getReader();
       const finalImages: string[] = [];
+      let sawNonFinalImage = false;
+      let firstNonFinalAt: number | null = null;
+      let lastActivityAt = startedAt;
       let buffer = "";
       let failed = false;
       try {
         while (true) {
-          const { value, done } = await reader.read();
+          const res = await readWithTimeout(reader, streamTimeoutMs);
+          if ("timeout" in res) {
+            const now = Date.now();
+            const hasBlockedWindowElapsed =
+              firstNonFinalAt !== null &&
+              !finalImages.length &&
+              now - firstNonFinalAt >= blockedGraceMs;
+            const hasFinalWindowElapsed =
+              firstNonFinalAt !== null &&
+              !finalImages.length &&
+              now - firstNonFinalAt >= finalTimeoutMs;
+            if (hasBlockedWindowElapsed || hasFinalWindowElapsed || now - lastActivityAt >= streamTimeoutMs) {
+              break;
+            }
+            continue;
+          }
+
+          const { value, done } = res;
           if (done) break;
           if (!value) continue;
+          lastActivityAt = Date.now();
           buffer += decoder.decode(value, { stream: true });
           let idx = buffer.indexOf("\n");
           while (idx >= 0) {
@@ -434,39 +943,83 @@ function createImageEventStream(args: {
             const rawUrls = normalizeGeneratedImageUrls(resp?.modelResponse?.generatedImageUrls);
             if (rawUrls.length) {
               for (const rawUrl of rawUrls) {
-                const converted = await convertRawUrlByFormat(rawUrl, args.responseFormat, {
+                const classified = await classifyRawUrlByFormat(rawUrl, args.responseFormat, {
                   baseUrl: args.baseUrl,
                   cookie: args.cookie,
                   settings: args.settings,
+                  imageSettings: args.settingsBundle.image,
                 });
-                finalImages.push(converted);
+                if (classified.stage === "final") {
+                  finalImages.push(classified.value);
+                } else {
+                  sawNonFinalImage = true;
+                  if (firstNonFinalAt === null) firstNonFinalAt = Date.now();
+                }
               }
             }
             idx = buffer.indexOf("\n");
           }
         }
 
-        for (let i = 0; i < finalImages.length; i++) {
-          if (args.n === 1 && i !== targetIndex) continue;
-          const outIndex = args.n === 1 ? 0 : i;
+        if (!finalImages.length && args.recovery) {
+          const recovered = await args.recovery();
+          finalImages.push(...recovered.filter(Boolean));
+        }
+
+        if (!finalImages.length && sawNonFinalImage) {
           controller.enqueue(
             encoder.encode(
-              buildImageSse("image_generation.completed", {
-                type: "image_generation.completed",
-                [responseField]: finalImages[i] ?? "",
-                index: outIndex,
-                usage: {
-                  total_tokens: 50,
-                  input_tokens: 25,
-                  output_tokens: 25,
-                  input_tokens_details: { text_tokens: 5, image_tokens: 20 },
-                },
+              buildImageSse("image_generation.error", {
+                type: "image_generation.error",
+                message: "No final image reached the configured final_min_bytes threshold",
               }),
             ),
           );
         }
+
+        if (args.n === 1) {
+          const value = finalImages[0];
+          if (value) {
+            controller.enqueue(
+              encoder.encode(
+                buildImageSse("image_generation.completed", {
+                  type: "image_generation.completed",
+                  [responseField]: value,
+                  index: 0,
+                  usage: {
+                    total_tokens: 50,
+                    input_tokens: 25,
+                    output_tokens: 25,
+                    input_tokens_details: { text_tokens: 5, image_tokens: 20 },
+                  },
+                }),
+              ),
+            );
+          }
+        } else {
+          for (let i = 0; i < finalImages.length; i++) {
+            controller.enqueue(
+              encoder.encode(
+                buildImageSse("image_generation.completed", {
+                  type: "image_generation.completed",
+                  [responseField]: finalImages[i] ?? "",
+                  index: i,
+                  usage: {
+                    total_tokens: 50,
+                    input_tokens: 25,
+                    output_tokens: 25,
+                    input_tokens_details: { text_tokens: 5, image_tokens: 20 },
+                  },
+                }),
+              ),
+            );
+          }
+        }
         if (args.onFinish) {
-          await args.onFinish({ status: 200, duration: (Date.now() - startedAt) / 1000 });
+          await args.onFinish({
+            status: finalImages.length ? 200 : 500,
+            duration: (Date.now() - startedAt) / 1000,
+          });
         }
       } catch (e) {
         failed = true;
@@ -497,6 +1050,20 @@ function getTokenSuffix(token: string): string {
 
 const IMAGE_GENERATION_MODEL_ID = "grok-imagine-1.0";
 const IMAGE_EDIT_MODEL_ID = "grok-imagine-1.0-edit";
+const VIDEO_MODEL_ID = "grok-imagine-1.0-video";
+
+const VIDEO_SIZE_TO_ASPECT_RATIO: Record<string, string> = {
+  "1280x720": "16:9",
+  "720x1280": "9:16",
+  "1792x1024": "3:2",
+  "1024x1792": "2:3",
+  "1024x1024": "1:1",
+};
+
+const VIDEO_QUALITY_TO_RESOLUTION: Record<string, "SD" | "HD"> = {
+  standard: "SD",
+  high: "HD",
+};
 
 function parseImageCount(input: unknown): number {
   const raw = Number(input ?? 1);
@@ -541,6 +1108,188 @@ function parseImageConcurrencyOrError(
   return { value };
 }
 
+function resolveMediaConcurrency(
+  settingsBundle: Awaited<ReturnType<typeof getSettings>>,
+  requested: number,
+  maximum = 3,
+): number {
+  const configured = Math.max(
+    1,
+    Math.floor(Number(settingsBundle.performance.media_max_concurrent ?? maximum) || maximum),
+  );
+  return Math.max(1, Math.min(maximum, configured, Math.floor(requested || 1)));
+}
+
+function resolveAssetsConcurrency(
+  settingsBundle: Awaited<ReturnType<typeof getSettings>>,
+  fallback = 5,
+): number {
+  const configured = Math.floor(Number(settingsBundle.performance.assets_max_concurrent ?? fallback) || fallback);
+  return Math.max(1, configured);
+}
+
+function resolveImagineTimeoutMs(settingsBundle: Awaited<ReturnType<typeof getSettings>>): number {
+  return Math.max(
+    10_000,
+    Math.floor(
+      Number(
+        settingsBundle.image.stream_timeout ??
+          settingsBundle.image.timeout ??
+          settingsBundle.grok.stream_total_timeout ??
+          120,
+      ) * 1000,
+    ),
+  );
+}
+
+function extractVideoUrl(content: string): string {
+  if (!content || !String(content).trim()) return "";
+
+  const markdownMatch = String(content).match(/\[video\]\(([^)\s]+)\)/);
+  if (markdownMatch?.[1]) return markdownMatch[1].trim();
+
+  const htmlMatch = String(content).match(/<source[^>]+src=["']([^"']+)["']/i);
+  if (htmlMatch?.[1]) return htmlMatch[1].trim();
+
+  const urlMatch = String(content).match(/https?:\/\/[^\s"'<>]+/i);
+  if (urlMatch?.[0]) return urlMatch[0].trim().replace(/[.,)]$/, "");
+
+  return "";
+}
+
+function normalizeVideoModelOrError(model: unknown): { value: string } | { error: { message: string; code: string } } {
+  const requestedModel = String(model ?? VIDEO_MODEL_ID).trim() || VIDEO_MODEL_ID;
+  if (requestedModel !== VIDEO_MODEL_ID) {
+    return {
+      error: {
+        message: `The model '${VIDEO_MODEL_ID}' is required for video generation.`,
+        code: "model_not_supported",
+      },
+    };
+  }
+  if (!isValidModel(requestedModel) || !MODEL_CONFIG[requestedModel]?.is_video_model) {
+    return {
+      error: {
+        message: `The model '${requestedModel}' is not supported for video generation.`,
+        code: "model_not_supported",
+      },
+    };
+  }
+  return { value: requestedModel };
+}
+
+function normalizeVideoSizeOrError(size: unknown): { size: string; aspectRatio: string } | { error: { message: string; code: string } } {
+  const value = String(size ?? "1792x1024").trim() || "1792x1024";
+  const aspectRatio = VIDEO_SIZE_TO_ASPECT_RATIO[value];
+  if (!aspectRatio) {
+    return {
+      error: {
+        message: `size must be one of ${JSON.stringify(Object.keys(VIDEO_SIZE_TO_ASPECT_RATIO).sort())}`,
+        code: "invalid_size",
+      },
+    };
+  }
+  return { size: value, aspectRatio };
+}
+
+function normalizeVideoQualityOrError(quality: unknown): { quality: string; resolution: "SD" | "HD" } | { error: { message: string; code: string } } {
+  const value = String(quality ?? "standard").trim().toLowerCase() || "standard";
+  const resolution = VIDEO_QUALITY_TO_RESOLUTION[value];
+  if (!resolution) {
+    return {
+      error: {
+        message: `quality must be one of ${JSON.stringify(Object.keys(VIDEO_QUALITY_TO_RESOLUTION).sort())}`,
+        code: "invalid_quality",
+      },
+    };
+  }
+  return { quality: value, resolution };
+}
+
+function normalizeVideoSecondsOrError(seconds: unknown): { value: number } | { error: { message: string; code: string } } {
+  const parsed = Math.floor(Number(seconds ?? 6) || 6);
+  if (parsed < 6 || parsed > 30) {
+    return {
+      error: {
+        message: "seconds must be between 6 and 30",
+        code: "invalid_seconds",
+      },
+    };
+  }
+  return { value: parsed };
+}
+
+function validateReferenceValue(value: string, param: string): { value: string } | { error: { message: string; code: string } } {
+  const candidate = String(value ?? "").trim();
+  if (!candidate) return { value: "" };
+  if (candidate.startsWith("http://") || candidate.startsWith("https://") || candidate.startsWith("data:")) {
+    return { value: candidate };
+  }
+  return {
+    error: {
+      message: `${param} must be a URL or data URI`,
+      code: "invalid_reference",
+    },
+  };
+}
+
+function parseVideoImageReference(value: unknown): { value: string | null } | { error: { message: string; code: string } } {
+  if (value == null || value === "") return { value: null };
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return { value: null };
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      try {
+        value = JSON.parse(trimmed);
+      } catch {
+        return validateReferenceValue(trimmed, "image_reference");
+      }
+    } else {
+      return validateReferenceValue(trimmed, "image_reference");
+    }
+  }
+
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {
+      error: {
+        message: "image_reference must be an object with exactly one of image_url or file_id",
+        code: "invalid_reference",
+      },
+    };
+  }
+
+  const record = value as Record<string, any>;
+  const imageUrl = typeof record.image_url === "string" ? record.image_url.trim() : "";
+  const fileId = typeof record.file_id === "string" ? record.file_id.trim() : "";
+  if (Boolean(imageUrl) === Boolean(fileId)) {
+    return {
+      error: {
+        message: "image_reference requires exactly one of image_url or file_id",
+        code: "invalid_reference",
+      },
+    };
+  }
+  if (fileId) {
+    return {
+      error: {
+        message: "image_reference.file_id is not supported in current reverse pipeline; please use image_reference.image_url or multipart input_reference",
+        code: "unsupported_reference",
+      },
+    };
+  }
+  return validateReferenceValue(imageUrl, "image_reference.image_url");
+}
+
+async function uploadFileToDataUri(file: File, param: string): Promise<string> {
+  const payload = await file.arrayBuffer();
+  if (!payload.byteLength) {
+    throw new Error(`${param} upload is empty`);
+  }
+  const contentType = String(file.type || "application/octet-stream").trim() || "application/octet-stream";
+  return `data:${contentType};base64,${arrayBufferToBase64(payload)}`;
+}
+
 function parseAllowedImageMime(file: File): string | null {
   const byMime = normalizeImageMime(String(file.type || ""));
   if (byMime === "image/png" || byMime === "image/jpeg" || byMime === "image/webp") return byMime;
@@ -549,8 +1298,16 @@ function parseAllowedImageMime(file: File): string | null {
   return null;
 }
 
-function buildCookie(token: string, cf: string): string {
-  return cf ? `sso-rw=${token};sso=${token};${cf}` : `sso-rw=${token};sso=${token}`;
+function buildCookie(
+  token: string,
+  settingsOrCf: Awaited<ReturnType<typeof getSettings>>["grok"] | string,
+): string {
+  if (typeof settingsOrCf === "string") {
+    return settingsOrCf
+      ? `sso-rw=${token};sso=${token};${settingsOrCf}`
+      : `sso-rw=${token};sso=${token}`;
+  }
+  return buildAuthCookie(token, settingsOrCf);
 }
 
 async function runImageCall(args: {
@@ -558,10 +1315,11 @@ async function runImageCall(args: {
   prompt: string;
   fileIds: string[];
   cookie: string;
+  settingsBundle: Awaited<ReturnType<typeof getSettings>>;
   settings: Awaited<ReturnType<typeof getSettings>>["grok"];
   responseFormat: ImageResponseFormat;
   baseUrl: string;
-}): Promise<string[]> {
+}): Promise<ClassifiedImageAsset[]> {
   const { payload, referer } = buildConversationPayload({
     requestModel: args.requestModel,
     content: args.prompt,
@@ -580,16 +1338,11 @@ async function runImageCall(args: {
     throw new Error(`Upstream ${upstream.status}: ${txt.slice(0, 200)}`);
   }
   const rawUrls = await collectImageUrls(upstream);
-  const converted = await Promise.all(
-    rawUrls.map((rawUrl) =>
-      convertRawUrlByFormat(rawUrl, args.responseFormat, {
-        baseUrl: args.baseUrl,
-        cookie: args.cookie,
-        settings: args.settings,
-      }),
-    ),
-  );
-  return converted.filter(Boolean);
+  return classifyRawUrlsByFormat(rawUrls, args.responseFormat, {
+    settingsBundle: args.settingsBundle,
+    baseUrl: args.baseUrl,
+    cookie: args.cookie,
+  });
 }
 
 async function runImageStreamCall(args: {
@@ -621,6 +1374,7 @@ function imageGenerationMethod(settingsBundle: Awaited<ReturnType<typeof getSett
 async function collectExperimentalGenerationImages(args: {
   prompt: string;
   n: number;
+  settingsBundle: Awaited<ReturnType<typeof getSettings>>;
   cookie: string;
   settings: Awaited<ReturnType<typeof getSettings>>["grok"];
   responseFormat: ImageResponseFormat;
@@ -637,13 +1391,14 @@ async function collectExperimentalGenerationImages(args: {
 
   const settled = await runTasksSettledWithLimit(
     plans,
-    Math.min(plans.length, Math.max(1, args.concurrency || 1)),
+    Math.min(plans.length, resolveMediaConcurrency(args.settingsBundle, args.concurrency, 3)),
     async (plan) =>
       generateImagineWs({
         prompt: args.prompt,
         n: plan.chunkN,
         cookie: args.cookie,
         settings: args.settings,
+        timeoutMs: resolveImagineTimeoutMs(args.settingsBundle),
         aspectRatio: args.aspectRatio,
       }),
   );
@@ -658,28 +1413,23 @@ async function collectExperimentalGenerationImages(args: {
     if (firstRejected) throw firstRejected.reason;
     throw new Error("Experimental imagine websocket returned no images");
   }
-  const dedupedRawUrls = dedupeImages(rawUrls);
-
-  const converted = await Promise.all(
-    dedupedRawUrls.map((rawUrl) =>
-      convertRawUrlByFormat(rawUrl, args.responseFormat, {
-        baseUrl: args.baseUrl,
-        cookie: args.cookie,
-        settings: args.settings,
-      }),
-    ),
-  );
-  return dedupeImages(converted.filter(Boolean));
+  const classified = await classifyRawUrlsByFormat(rawUrls, args.responseFormat, {
+    settingsBundle: args.settingsBundle,
+    baseUrl: args.baseUrl,
+    cookie: args.cookie,
+  });
+  return finalImageValues(classified);
 }
 
 async function runExperimentalImageEditCall(args: {
   prompt: string;
   fileUris: string[];
+  settingsBundle: Awaited<ReturnType<typeof getSettings>>;
   cookie: string;
   settings: Awaited<ReturnType<typeof getSettings>>["grok"];
   responseFormat: ImageResponseFormat;
   baseUrl: string;
-}): Promise<string[]> {
+}): Promise<ClassifiedImageAsset[]> {
   const upstream = await sendExperimentalImageEditRequest({
     prompt: args.prompt,
     fileUris: args.fileUris,
@@ -687,16 +1437,11 @@ async function runExperimentalImageEditCall(args: {
     settings: args.settings,
   });
   const rawUrls = await collectImageUrls(upstream);
-  const converted = await Promise.all(
-    rawUrls.map((rawUrl) =>
-      convertRawUrlByFormat(rawUrl, args.responseFormat, {
-        baseUrl: args.baseUrl,
-        cookie: args.cookie,
-        settings: args.settings,
-      }),
-    ),
-  );
-  return converted.filter(Boolean);
+  return classifyRawUrlsByFormat(rawUrls, args.responseFormat, {
+    settingsBundle: args.settingsBundle,
+    baseUrl: args.baseUrl,
+    cookie: args.cookie,
+  });
 }
 
 function createSyntheticImageEventStream(args: {
@@ -825,6 +1570,7 @@ function createStreamErrorImageEventStream(args: {
 function createExperimentalImageEventStream(args: {
   prompt: string;
   n: number;
+  settingsBundle: Awaited<ReturnType<typeof getSettings>>;
   cookie: string;
   settings: Awaited<ReturnType<typeof getSettings>>["grok"];
   responseFormat: ImageResponseFormat;
@@ -836,12 +1582,13 @@ function createExperimentalImageEventStream(args: {
 }): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
   const safeN = Math.max(1, Math.floor(args.n || 1));
-  const concurrency = Math.max(1, Math.min(3, Math.floor(args.concurrency || 1)));
+  const concurrency = resolveMediaConcurrency(args.settingsBundle, args.concurrency, 3);
 
   return new ReadableStream<Uint8Array>({
     async start(controller) {
       const startedAt = Date.now();
       const completedByIndex = new Map<number, string>();
+      let sawNonFinalImage = false;
 
       const emitPartial = (index: number, progress: number) => {
         if (index < 0 || index >= safeN) return;
@@ -904,18 +1651,22 @@ function createExperimentalImageEventStream(args: {
               n: plan.chunkN,
               cookie: args.cookie,
               settings: args.settings,
+              timeoutMs: resolveImagineTimeoutMs(args.settingsBundle),
               aspectRatio: args.aspectRatio,
               progressCb: ({ index, progress }) => {
                 emitPartial(toOutIndex(plan.offset, index), progress);
               },
               completedCb: async ({ index, url }) => {
-                const converted = await convertRawUrlByFormat(url, args.responseFormat, {
+                const classified = await classifyRawUrlByFormat(url, args.responseFormat, {
                   baseUrl: args.baseUrl,
                   cookie: args.cookie,
                   settings: args.settings,
+                  imageSettings: args.settingsBundle.image,
                 });
-                if (converted) {
-                  emitCompleted(toOutIndex(plan.offset, index), converted);
+                if (classified.stage === "final" && classified.value) {
+                  emitCompleted(toOutIndex(plan.offset, index), classified.value);
+                } else {
+                  sawNonFinalImage = true;
                 }
               },
             });
@@ -929,13 +1680,16 @@ function createExperimentalImageEventStream(args: {
           for (let i = 0; i < rawUrls.length; i++) {
             const outIndex = toOutIndex(plan.offset, i);
             if (completedByIndex.has(outIndex)) continue;
-            const converted = await convertRawUrlByFormat(rawUrls[i] ?? "", args.responseFormat, {
+            const classified = await classifyRawUrlByFormat(rawUrls[i] ?? "", args.responseFormat, {
               baseUrl: args.baseUrl,
               cookie: args.cookie,
               settings: args.settings,
+              imageSettings: args.settingsBundle.image,
             });
-            if (converted) {
-              emitCompleted(outIndex, converted);
+            if (classified.stage === "final" && classified.value) {
+              emitCompleted(outIndex, classified.value);
+            } else {
+              sawNonFinalImage = true;
             }
           }
         }
@@ -945,6 +1699,7 @@ function createExperimentalImageEventStream(args: {
             const allImages = await collectExperimentalGenerationImages({
               prompt: args.prompt,
               n: safeN,
+              settingsBundle: args.settingsBundle,
               cookie: args.cookie,
               settings: args.settings,
               responseFormat: args.responseFormat,
@@ -969,6 +1724,17 @@ function createExperimentalImageEventStream(args: {
               ),
             );
           }
+        }
+
+        if (!Array.from(completedByIndex.values()).some((v) => v && v !== "error") && sawNonFinalImage) {
+          controller.enqueue(
+            encoder.encode(
+              buildImageSse("image_generation.error", {
+                type: "image_generation.error",
+                message: "No final image reached the configured final_min_bytes threshold",
+              }),
+            ),
+          );
         }
 
         for (let i = 0; i < safeN; i++) {
@@ -1000,6 +1766,67 @@ function createExperimentalImageEventStream(args: {
       }
     },
   });
+}
+
+function hasSuccessfulImageResults(values: string[]): boolean {
+  return values.some((value) => typeof value === "string" && value.trim() && value !== "error");
+}
+
+async function recoverImageResults(args: {
+  env: Env;
+  settingsBundle: Awaited<ReturnType<typeof getSettings>>;
+  requestedModel: string;
+  prompt: string;
+  fileIds: string[];
+  responseFormat: ImageResponseFormat;
+  baseUrl: string;
+  desiredCount: number;
+  excludeTokens?: Iterable<string>;
+}): Promise<string[]> {
+  if (!args.settingsBundle.image.blocked_parallel_enabled) return [];
+
+  const attemptCount = Math.max(0, Math.floor(Number(args.settingsBundle.image.blocked_parallel_attempts ?? 0)));
+  if (attemptCount <= 0) return [];
+
+  const preferredTags = preferredImageTags(args.settingsBundle);
+  const selectedTokens = await selectDistinctTokens(args.env.DB, args.requestedModel, attemptCount, {
+    exclude: args.excludeTokens,
+    preferTags: preferredTags,
+  });
+  if (!selectedTokens.length) return [];
+
+  const settled = await runTasksSettledWithLimit(
+    selectedTokens,
+    resolveMediaConcurrency(args.settingsBundle, selectedTokens.length, 6),
+    async (tokenInfo) => {
+      const cookie = buildCookie(tokenInfo.token, args.settingsBundle.grok);
+      try {
+        return await runImageCall({
+          requestModel: args.requestedModel,
+          prompt: args.prompt,
+          fileIds: args.fileIds,
+          cookie,
+          settingsBundle: args.settingsBundle,
+          settings: args.settingsBundle.grok,
+          responseFormat: args.responseFormat,
+          baseUrl: args.baseUrl,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await recordTokenFailure(args.env.DB, tokenInfo.token, 500, message.slice(0, 200));
+        await applyCooldown(args.env.DB, tokenInfo.token, 500);
+        throw error;
+      }
+    },
+  );
+
+  const recovered: string[] = [];
+  for (const item of settled) {
+    if (item.status === "fulfilled") {
+      recovered.push(...finalImageValues(item.value));
+    }
+  }
+  return dedupeImages(recovered).slice(0, Math.max(1, args.desiredCount));
 }
 
 function streamHeaders(): Record<string, string> {
@@ -1187,18 +2014,17 @@ openAiRoutes.get("/images/method", async (c) => {
 });
 
 openAiRoutes.post("/chat/completions", async (c) => {
-  const start = Date.now();
-  const ip = getClientIp(c.req.raw);
-  const keyName = c.get("apiAuth").name ?? "Unknown";
-
-  const origin = new URL(c.req.url).origin;
-
-  let requestedModel = "";
   try {
     const body = (await c.req.json()) as {
       model?: string;
       messages?: any[];
       stream?: boolean;
+      temperature?: number;
+      top_p?: number;
+      tools?: Array<Record<string, any>>;
+      tool_choice?: unknown;
+      parallel_tool_calls?: boolean;
+      reasoning_effort?: string;
       video_config?: {
         aspect_ratio?: string;
         video_length?: number;
@@ -1207,180 +2033,283 @@ openAiRoutes.post("/chat/completions", async (c) => {
       };
     };
 
-    requestedModel = String(body.model ?? "");
+    const requestedModel = String(body.model ?? "");
     if (!requestedModel) return c.json(openAiError("Missing 'model'", "missing_model"), 400);
     if (!Array.isArray(body.messages)) return c.json(openAiError("Missing 'messages'", "missing_messages"), 400);
     if (!isValidModel(requestedModel))
       return c.json(openAiError(`Model '${requestedModel}' not supported`, "model_not_supported"), 400);
+    const toolsError = validateTools(body.tools);
+    if (toolsError) return c.json(openAiError(toolsError, "invalid_tools"), 400);
+    const toolChoiceError = validateToolChoice(body.tool_choice);
+    if (toolChoiceError) return c.json(openAiError(toolChoiceError, "invalid_tool_choice"), 400);
+    const reasoningError = validateReasoningEffort(body.reasoning_effort);
+    if (reasoningError) return c.json(openAiError(reasoningError, "invalid_reasoning_effort"), 400);
 
-    const settingsBundle = await getSettings(c.env);
-    const cfg = MODEL_CONFIG[requestedModel]!;
-
-    const retryCodes = Array.isArray(settingsBundle.grok.retry_status_codes)
-      ? settingsBundle.grok.retry_status_codes
-      : [401, 429];
-
-    const stream = Boolean(body.stream);
-    const maxRetry = 3;
-    let lastErr: string | null = null;
-
-    // === Quota check (best-effort) ===
-    // - heavy: consumes both heavy + chat
-    // - image model: counts as 2 images per request (grok upstream emits up to 2)
-    // - video model: 1 video per request
-    // - others: 1 chat per request
-    const quotaKind = cfg.is_video_model ? "video" : cfg.is_image_model ? "image" : "chat";
-    const quota = await enforceQuota({
-      env: c.env,
-      apiAuth: c.get("apiAuth"),
+    const outcome = await executeConversationRequest(c, {
       model: requestedModel,
-      kind: quotaKind as any,
-      ...(cfg.is_image_model ? { imageCount: 2 } : {}),
+      messages: body.messages,
+      stream: Boolean(body.stream),
+      videoConfig: body.video_config,
+      temperature: Number.isFinite(Number(body.temperature)) ? Number(body.temperature) : undefined,
+      topP: Number.isFinite(Number(body.top_p)) ? Number(body.top_p) : undefined,
+      tools: body.tools ?? null,
+      toolChoice: body.tool_choice,
+      parallelToolCalls: body.parallel_tool_calls !== false,
+      reasoningEffort: body.reasoning_effort ?? null,
     });
-    if (!quota.ok) return quota.resp;
 
-    for (let attempt = 0; attempt < maxRetry; attempt++) {
-      const chosen = await selectBestToken(c.env.DB, requestedModel);
-      if (!chosen) return c.json(openAiError("No available token", "NO_AVAILABLE_TOKEN"), 503);
+    if ("errorResponse" in outcome) return outcome.errorResponse;
+    if ("stream" in outcome) {
+      return new Response(outcome.stream, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+          "X-Accel-Buffering": "no",
+          "Access-Control-Allow-Origin": "*",
+        },
+      });
+    }
 
-      const jwt = chosen.token;
-      const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
-      const cookie = cf ? `sso-rw=${jwt};sso=${jwt};${cf}` : `sso-rw=${jwt};sso=${jwt}`;
+    return c.json(outcome.json);
+  } catch (e) {
+    return c.json(openAiError("Internal error", "internal_error"), 500);
+  }
+});
 
-      const { content, images } = extractContent(body.messages as any);
-      const isVideoModel = Boolean(cfg.is_video_model);
-      const imgInputs = isVideoModel && images.length > 1 ? images.slice(0, 1) : images;
+openAiRoutes.post("/responses", async (c) => {
+  try {
+    const body = (await c.req.json()) as {
+      model?: string;
+      input?: unknown;
+      instructions?: string;
+      stream?: boolean;
+      max_output_tokens?: number;
+      temperature?: number;
+      top_p?: number;
+      tools?: Array<Record<string, any>>;
+      tool_choice?: unknown;
+      parallel_tool_calls?: boolean;
+      reasoning?: { effort?: string; reasoning_effort?: string };
+      metadata?: Record<string, any>;
+      user?: string;
+      store?: boolean;
+      previous_response_id?: string;
+      truncation?: string;
+    };
 
+    const requestedModel = String(body.model ?? "");
+    if (!requestedModel) return c.json(openAiError("model is required", "invalid_request_error"), 400);
+    if (!isValidModel(requestedModel)) {
+      return c.json(openAiError(`Model '${requestedModel}' not supported`, "model_not_supported"), 400);
+    }
+    if (body.input == null) {
+      return c.json(openAiError("input is required", "invalid_request_error"), 400);
+    }
+
+    const reasoningEffort =
+      body.reasoning && typeof body.reasoning === "object"
+        ? body.reasoning.effort ?? body.reasoning.reasoning_effort ?? null
+        : null;
+
+    const toolsError = validateTools(body.tools, { allowBuiltins: true });
+    if (toolsError) return c.json(openAiError(toolsError, "invalid_tools"), 400);
+    const toolChoiceError = validateToolChoice(normalizeToolChoice(body.tool_choice));
+    if (toolChoiceError) return c.json(openAiError(toolChoiceError, "invalid_tool_choice"), 400);
+    const reasoningError = validateReasoningEffort(reasoningEffort);
+    if (reasoningError) return c.json(openAiError(reasoningError, "invalid_reasoning_effort"), 400);
+
+    const messages = coerceInputToMessages(body.input);
+    if (typeof body.instructions === "string" && body.instructions.trim()) {
+      messages.unshift({ role: "system", content: body.instructions.trim() });
+    }
+    if (!messages.length) {
+      return c.json(openAiError("input is required", "invalid_request_error"), 400);
+    }
+
+    const normalizedTools = normalizeToolsForChat(body.tools ?? null);
+    const normalizedToolChoice = normalizeToolChoice(body.tool_choice);
+    const stream = Boolean(body.stream);
+    const outcome = await executeConversationRequest(c, {
+      model: requestedModel,
+      messages,
+      stream,
+      temperature: Number.isFinite(Number(body.temperature)) ? Number(body.temperature) : undefined,
+      topP: Number.isFinite(Number(body.top_p)) ? Number(body.top_p) : undefined,
+      tools: normalizedTools,
+      toolChoice: normalizedToolChoice,
+      parallelToolCalls: body.parallel_tool_calls !== false,
+      reasoningEffort,
+    });
+
+    if ("errorResponse" in outcome) return outcome.errorResponse;
+    if ("stream" in outcome) {
+      const responseStream = createResponsesStreamFromOpenAiStream(outcome.stream, {
+        model: requestedModel,
+        instructions: body.instructions ?? null,
+        maxOutputTokens:
+          Number.isFinite(Number(body.max_output_tokens)) ? Number(body.max_output_tokens) : null,
+        parallelToolCalls: body.parallel_tool_calls !== false,
+        previousResponseId: body.previous_response_id ?? null,
+        reasoningEffort,
+        store: body.store ?? true,
+        temperature: Number.isFinite(Number(body.temperature)) ? Number(body.temperature) : null,
+        toolChoice: body.tool_choice ?? "auto",
+        tools: body.tools ?? [],
+        topP: Number.isFinite(Number(body.top_p)) ? Number(body.top_p) : null,
+        truncation: body.truncation ?? "disabled",
+        user: body.user ?? null,
+        metadata: body.metadata ?? {},
+      });
+
+      return new Response(responseStream, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+          "X-Accel-Buffering": "no",
+          "Access-Control-Allow-Origin": "*",
+        },
+      });
+    }
+
+    const choice = (outcome.json.choices as Array<Record<string, any>> | undefined)?.[0] ?? {};
+    const message = (choice.message as Record<string, any> | undefined) ?? {};
+    return c.json(
+      buildResponseObject({
+        model: requestedModel,
+        outputText: (message.content as string | null | undefined) ?? null,
+        toolCalls: (message.tool_calls as OpenAIToolCall[] | undefined) ?? null,
+        usage: (outcome.json.usage as Record<string, any> | null | undefined) ?? null,
+        instructions: body.instructions ?? null,
+        maxOutputTokens:
+          Number.isFinite(Number(body.max_output_tokens)) ? Number(body.max_output_tokens) : null,
+        parallelToolCalls: body.parallel_tool_calls !== false,
+        previousResponseId: body.previous_response_id ?? null,
+        reasoningEffort,
+        store: body.store ?? true,
+        temperature: Number.isFinite(Number(body.temperature)) ? Number(body.temperature) : null,
+        toolChoice: body.tool_choice ?? "auto",
+        tools: body.tools ?? [],
+        topP: Number.isFinite(Number(body.top_p)) ? Number(body.top_p) : null,
+        truncation: body.truncation ?? "disabled",
+        user: body.user ?? null,
+        metadata: body.metadata ?? {},
+      }),
+    );
+  } catch {
+    return c.json(openAiError("Internal error", "internal_error"), 500);
+  }
+});
+
+openAiRoutes.post("/videos", async (c) => {
+  try {
+    const contentType = String(c.req.header("content-type") ?? "").toLowerCase();
+    let prompt = "";
+    let modelInput: unknown = VIDEO_MODEL_ID;
+    let sizeInput: unknown = "1792x1024";
+    let secondsInput: unknown = 6;
+    let qualityInput: unknown = "standard";
+    let imageReferenceInput: unknown = null;
+    let inputReferenceFile: File | null = null;
+
+    if (contentType.includes("application/json")) {
+      const body = (await c.req.json()) as Record<string, any>;
+      prompt = String(body.prompt ?? "").trim();
+      modelInput = body.model;
+      sizeInput = body.size;
+      secondsInput = body.seconds;
+      qualityInput = body.quality;
+      imageReferenceInput = body.image_reference ?? null;
+    } else {
+      const form = await c.req.formData();
+      prompt = String(form.get("prompt") ?? "").trim();
+      modelInput = form.get("model");
+      sizeInput = form.get("size");
+      secondsInput = form.get("seconds");
+      qualityInput = form.get("quality");
+      imageReferenceInput = form.get("image_reference");
+      const rawInputReference = form.get("input_reference");
+      inputReferenceFile = rawInputReference instanceof File ? rawInputReference : null;
+    }
+
+    if (!prompt) {
+      return c.json(openAiError("prompt is required", "invalid_request_error"), 400);
+    }
+
+    const modelResult = normalizeVideoModelOrError(modelInput);
+    if ("error" in modelResult) return c.json(openAiError(modelResult.error.message, modelResult.error.code), 400);
+    const sizeResult = normalizeVideoSizeOrError(sizeInput);
+    if ("error" in sizeResult) return c.json(openAiError(sizeResult.error.message, sizeResult.error.code), 400);
+    const qualityResult = normalizeVideoQualityOrError(qualityInput);
+    if ("error" in qualityResult) return c.json(openAiError(qualityResult.error.message, qualityResult.error.code), 400);
+    const secondsResult = normalizeVideoSecondsOrError(secondsInput);
+    if ("error" in secondsResult) return c.json(openAiError(secondsResult.error.message, secondsResult.error.code), 400);
+
+    const references: string[] = [];
+    const imageReferenceResult = parseVideoImageReference(imageReferenceInput);
+    if ("error" in imageReferenceResult) {
+      return c.json(openAiError(imageReferenceResult.error.message, imageReferenceResult.error.code), 400);
+    }
+    if (imageReferenceResult.value) {
+      references.push(imageReferenceResult.value);
+    }
+    if (inputReferenceFile) {
       try {
-        const uploads = await mapLimit(imgInputs, 5, (u) => uploadImage(u, cookie, settingsBundle.grok));
-        const imgIds = uploads.map((u) => u.fileId).filter(Boolean);
-        const imgUris = uploads.map((u) => u.fileUri).filter(Boolean);
-
-        let postId: string | undefined;
-        if (isVideoModel) {
-          if (imgUris.length) {
-            const post = await createPost(imgUris[0]!, cookie, settingsBundle.grok);
-            postId = post.postId || undefined;
-          } else {
-            const post = await createMediaPost(
-              { mediaType: "MEDIA_POST_TYPE_VIDEO", prompt: content },
-              cookie,
-              settingsBundle.grok,
-            );
-            postId = post.postId || undefined;
-          }
-        }
-
-        const { payload, referer } = buildConversationPayload({
-          requestModel: requestedModel,
-          content,
-          imgIds,
-          imgUris,
-          ...(postId ? { postId } : {}),
-          ...(isVideoModel && body.video_config ? { videoConfig: body.video_config } : {}),
-          settings: settingsBundle.grok,
-        });
-
-        const upstream = await sendConversationRequest({
-          payload,
-          cookie,
-          settings: settingsBundle.grok,
-          ...(referer ? { referer } : {}),
-        });
-
-        if (!upstream.ok) {
-          const txt = await upstream.text().catch(() => "");
-          lastErr = `Upstream ${upstream.status}: ${txt.slice(0, 200)}`;
-          await recordTokenFailure(c.env.DB, jwt, upstream.status, txt.slice(0, 200));
-          await applyCooldown(c.env.DB, jwt, upstream.status);
-          if (retryCodes.includes(upstream.status) && attempt < maxRetry - 1) continue;
-          break;
-        }
-
-        if (stream) {
-          const sse = createOpenAiStreamFromGrokNdjson(upstream, {
-            cookie,
-            settings: settingsBundle.grok,
-            global: settingsBundle.global,
-            origin,
-            requestedModel,
-            onFinish: async ({ status, duration }) => {
-              await addRequestLog(c.env.DB, {
-                ip,
-                model: requestedModel,
-                duration: Number(duration.toFixed(2)),
-                status,
-                key_name: keyName,
-                token_suffix: jwt.slice(-6),
-                error: status === 200 ? "" : "stream_error",
-              });
-            },
-          });
-
-          return new Response(sse, {
-            status: 200,
-            headers: {
-              "Content-Type": "text/event-stream; charset=utf-8",
-              "Cache-Control": "no-cache",
-              Connection: "keep-alive",
-              "X-Accel-Buffering": "no",
-              "Access-Control-Allow-Origin": "*",
-            },
-          });
-        }
-
-        const json = await parseOpenAiFromGrokNdjson(upstream, {
-          cookie,
-          settings: settingsBundle.grok,
-          global: settingsBundle.global,
-          origin,
-          requestedModel,
-        });
-
-        const duration = (Date.now() - start) / 1000;
-        await addRequestLog(c.env.DB, {
-          ip,
-          model: requestedModel,
-          duration: Number(duration.toFixed(2)),
-          status: 200,
-          key_name: keyName,
-          token_suffix: jwt.slice(-6),
-          error: "",
-        });
-
-        return c.json(json);
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        lastErr = msg;
-        await recordTokenFailure(c.env.DB, jwt, 500, msg);
-        await applyCooldown(c.env.DB, jwt, 500);
-        if (attempt < maxRetry - 1) continue;
+        references.unshift(await uploadFileToDataUri(inputReferenceFile, "input_reference"));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return c.json(openAiError(message, "invalid_reference"), 400);
       }
     }
 
-    const duration = (Date.now() - start) / 1000;
-    await addRequestLog(c.env.DB, {
-      ip,
-      model: requestedModel,
-      duration: Number(duration.toFixed(2)),
-      status: 500,
-      key_name: keyName,
-      token_suffix: "",
-      error: lastErr ?? "unknown_error",
+    const content: Array<Record<string, any>> = [{ type: "text", text: prompt }];
+    for (const reference of references) {
+      content.push({ type: "image_url", image_url: { url: reference } });
+    }
+
+    const outcome = await executeConversationRequest(c, {
+      model: modelResult.value,
+      messages: [{ role: "user", content }],
+      stream: false,
+      videoConfig: {
+        aspect_ratio: sizeResult.aspectRatio,
+        video_length: secondsResult.value,
+        resolution: qualityResult.resolution,
+        preset: "custom",
+      },
     });
 
-    return c.json(openAiError(lastErr ?? "Upstream error", "upstream_error"), 500);
-  } catch (e) {
-    const duration = (Date.now() - start) / 1000;
-    await addRequestLog(c.env.DB, {
-      ip,
-      model: requestedModel || "unknown",
-      duration: Number(duration.toFixed(2)),
-      status: 500,
-      key_name: keyName,
-      token_suffix: "",
-      error: e instanceof Error ? e.message : String(e),
+    if ("errorResponse" in outcome) return outcome.errorResponse;
+    if ("stream" in outcome) {
+      return c.json(openAiError("Video generation returned unexpected stream response", "upstream_error"), 500);
+    }
+
+    const choice = (outcome.json.choices as Array<Record<string, any>> | undefined)?.[0] ?? {};
+    const message = (choice.message as Record<string, any> | undefined) ?? {};
+    const rendered = String(message.content ?? "");
+    const videoUrl = extractVideoUrl(rendered);
+    if (!videoUrl) {
+      return c.json(openAiError("Video generation failed: missing video URL", "upstream_error"), 500);
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    return c.json({
+      id: `video_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+      object: "video",
+      created_at: now,
+      completed_at: now,
+      status: "completed",
+      model: modelResult.value,
+      prompt,
+      size: sizeResult.size,
+      seconds: String(secondsResult.value),
+      quality: qualityResult.quality,
+      url: videoUrl,
     });
+  } catch {
     return c.json(openAiError("Internal error", "internal_error"), 500);
   }
 });
@@ -1442,7 +2371,6 @@ openAiRoutes.post("/images/generations", async (c) => {
     const responseFormat = parsedResponseFormat.value;
     const responseField = responseFieldName(responseFormat);
     const baseUrl = baseUrlFromSettings(settingsBundle, origin);
-    const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
 
     const quota = await enforceQuota({
       env: c.env,
@@ -1455,12 +2383,16 @@ openAiRoutes.post("/images/generations", async (c) => {
 
     if (stream) {
       if (imageMethod === IMAGE_METHOD_IMAGINE_WS_EXPERIMENTAL) {
-        const experimentalToken = await selectBestToken(c.env.DB, requestedModel);
+        const experimentalToken = await selectPreferredToken(c.env.DB, requestedModel, {
+          preferTags: preferredImageTags(settingsBundle),
+          refreshCooling: true,
+        });
         if (experimentalToken) {
-          const experimentalCookie = buildCookie(experimentalToken.token, cf);
+          const experimentalCookie = buildCookie(experimentalToken.token, settingsBundle.grok);
           const streamBody = createExperimentalImageEventStream({
             prompt: imageCallPrompt("generation", prompt),
             n,
+            settingsBundle,
             cookie: experimentalCookie,
             settings: settingsBundle.grok,
             responseFormat,
@@ -1484,7 +2416,10 @@ openAiRoutes.post("/images/generations", async (c) => {
         }
       }
 
-      const chosen = await selectBestToken(c.env.DB, requestedModel);
+      const chosen = await selectPreferredToken(c.env.DB, requestedModel, {
+        preferTags: preferredImageTags(settingsBundle),
+        refreshCooling: true,
+      });
       if (!chosen) {
         await recordImageLog({
           env: c.env,
@@ -1503,7 +2438,7 @@ openAiRoutes.post("/images/generations", async (c) => {
           { status: 200, headers: streamHeaders() },
         );
       }
-      const cookie = buildCookie(chosen.token, cf);
+      const cookie = buildCookie(chosen.token, settingsBundle.grok);
 
       const upstream = await runImageStreamCall({
         requestModel: requestedModel,
@@ -1539,11 +2474,24 @@ openAiRoutes.post("/images/generations", async (c) => {
 
       const streamBody = createImageEventStream({
         upstream,
+        settingsBundle,
         responseFormat,
         baseUrl,
         cookie,
         settings: settingsBundle.grok,
         n,
+        recovery: async () =>
+          recoverImageResults({
+            env: c.env,
+            settingsBundle,
+            requestedModel,
+            prompt: imageCallPrompt("generation", prompt),
+            fileIds: [],
+            responseFormat,
+            baseUrl,
+            desiredCount: n,
+            excludeTokens: [chosen.token],
+          }),
         onFinish: async ({ status, duration }) => {
           await addRequestLog(c.env.DB, {
             ip,
@@ -1560,13 +2508,17 @@ openAiRoutes.post("/images/generations", async (c) => {
     }
 
     if (imageMethod === IMAGE_METHOD_IMAGINE_WS_EXPERIMENTAL) {
-      const experimentalToken = await selectBestToken(c.env.DB, requestedModel);
+      const experimentalToken = await selectPreferredToken(c.env.DB, requestedModel, {
+        preferTags: preferredImageTags(settingsBundle),
+        refreshCooling: true,
+      });
       if (experimentalToken) {
-        const experimentalCookie = buildCookie(experimentalToken.token, cf);
+        const experimentalCookie = buildCookie(experimentalToken.token, settingsBundle.grok);
         try {
           const urls = await collectExperimentalGenerationImages({
             prompt: imageCallPrompt("generation", prompt),
             n,
+            settingsBundle,
             cookie: experimentalCookie,
             settings: settingsBundle.grok,
             responseFormat,
@@ -1596,32 +2548,51 @@ openAiRoutes.post("/images/generations", async (c) => {
     }
 
     const calls = Math.ceil(n / 2);
+    const selectedTokens = await selectDistinctTokens(c.env.DB, requestedModel, calls, {
+      preferTags: preferredImageTags(settingsBundle),
+    });
+    if (!selectedTokens.length) throw new Error("No available token");
     const urlsNested = await mapLimit(
-      Array.from({ length: calls }),
-      Math.min(calls, Math.max(1, concurrency)),
-      async () => {
-      const chosen = await selectBestToken(c.env.DB, requestedModel);
-      if (!chosen) throw new Error("No available token");
-      const cookie = buildCookie(chosen.token, cf);
-      try {
-        return await runImageCall({
-          requestModel: requestedModel,
-          prompt: imageCallPrompt("generation", prompt),
-          fileIds: [],
-          cookie,
-          settings: settingsBundle.grok,
-          responseFormat,
-          baseUrl,
-        });
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        await recordTokenFailure(c.env.DB, chosen.token, 500, msg.slice(0, 200));
-        await applyCooldown(c.env.DB, chosen.token, 500);
-        throw e;
-      }
-    },
+      selectedTokens,
+      resolveMediaConcurrency(settingsBundle, concurrency, 6),
+      async (tokenInfo) => {
+        const cookie = buildCookie(tokenInfo.token, settingsBundle.grok);
+        try {
+          return await runImageCall({
+            requestModel: requestedModel,
+            prompt: imageCallPrompt("generation", prompt),
+            fileIds: [],
+            cookie,
+            settingsBundle,
+            settings: settingsBundle.grok,
+            responseFormat,
+            baseUrl,
+          });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          await recordTokenFailure(c.env.DB, tokenInfo.token, 500, msg.slice(0, 200));
+          await applyCooldown(c.env.DB, tokenInfo.token, 500);
+          throw e;
+        }
+      },
     );
-    const urls = dedupeImages(urlsNested.flat().filter(Boolean));
+    let urls = dedupeImages(urlsNested.flatMap((items) => finalImageValues(items)));
+    if (!hasSuccessfulImageResults(urls)) {
+      const recovered = await recoverImageResults({
+        env: c.env,
+        settingsBundle,
+        requestedModel,
+        prompt: imageCallPrompt("generation", prompt),
+        fileIds: [],
+        responseFormat,
+        baseUrl,
+        desiredCount: n,
+        excludeTokens: selectedTokens.map((token) => token.token),
+      });
+      if (hasSuccessfulImageResults(recovered)) {
+        urls = dedupeImages(recovered);
+      }
+    }
     const selected = pickImageResults(urls, n);
 
     await recordImageLog({
@@ -1718,7 +2689,10 @@ openAiRoutes.post("/images/edits", async (c) => {
     });
     if (!quota.ok) return quota.resp;
 
-    const chosen = await selectBestToken(c.env.DB, requestedModel);
+    const chosen = await selectPreferredToken(c.env.DB, requestedModel, {
+      preferTags: preferredImageTags(settingsBundle),
+      refreshCooling: true,
+    });
     if (!chosen) {
       if (stream) {
         await recordImageLog({
@@ -1740,8 +2714,7 @@ openAiRoutes.post("/images/edits", async (c) => {
       }
       return c.json(openAiError("No available token", "NO_AVAILABLE_TOKEN"), 503);
     }
-    const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
-    const cookie = buildCookie(chosen.token, cf);
+    const cookie = buildCookie(chosen.token, settingsBundle.grok);
 
     const fileIds: string[] = [];
     const fileUris: string[] = [];
@@ -1780,11 +2753,24 @@ openAiRoutes.post("/images/edits", async (c) => {
 
           const streamBody = createImageEventStream({
             upstream,
+            settingsBundle,
             responseFormat,
             baseUrl,
             cookie,
             settings: settingsBundle.grok,
             n,
+            recovery: async () =>
+              recoverImageResults({
+                env: c.env,
+                settingsBundle,
+                requestedModel,
+                prompt: imageCallPrompt("edit", prompt),
+                fileIds,
+                responseFormat,
+                baseUrl,
+                desiredCount: n,
+                excludeTokens: [chosen.token],
+              }),
             onFinish: async ({ status, duration }) => {
               await addRequestLog(c.env.DB, {
                 ip,
@@ -1840,11 +2826,24 @@ openAiRoutes.post("/images/edits", async (c) => {
 
       const streamBody = createImageEventStream({
         upstream,
+        settingsBundle,
         responseFormat,
         baseUrl,
         cookie,
         settings: settingsBundle.grok,
         n,
+        recovery: async () =>
+          recoverImageResults({
+            env: c.env,
+            settingsBundle,
+            requestedModel,
+            prompt: imageCallPrompt("edit", prompt),
+            fileIds,
+            responseFormat,
+            baseUrl,
+            desiredCount: n,
+            excludeTokens: [chosen.token],
+          }),
         onFinish: async ({ status, duration }) => {
           await addRequestLog(c.env.DB, {
             ip,
@@ -1863,17 +2862,37 @@ openAiRoutes.post("/images/edits", async (c) => {
     if (imageMethod === IMAGE_METHOD_IMAGINE_WS_EXPERIMENTAL) {
       try {
         const calls = Math.ceil(n / 2);
-        const urlsNested = await mapLimit(Array.from({ length: calls }), 3, async () =>
+        const urlsNested = await mapLimit(
+          Array.from({ length: calls }),
+          resolveMediaConcurrency(settingsBundle, calls, 6),
+          async () =>
           runExperimentalImageEditCall({
             prompt: imageCallPrompt("edit", prompt),
             fileUris,
+            settingsBundle,
             cookie,
             settings: settingsBundle.grok,
             responseFormat,
             baseUrl,
           }),
         );
-        const urls = dedupeImages(urlsNested.flat().filter(Boolean));
+        let urls = dedupeImages(urlsNested.flatMap((items) => finalImageValues(items)));
+        if (!hasSuccessfulImageResults(urls)) {
+          const recovered = await recoverImageResults({
+            env: c.env,
+            settingsBundle,
+            requestedModel,
+            prompt: imageCallPrompt("edit", prompt),
+            fileIds,
+            responseFormat,
+            baseUrl,
+            desiredCount: n,
+            excludeTokens: [chosen.token],
+          });
+          if (hasSuccessfulImageResults(recovered)) {
+            urls = dedupeImages(recovered);
+          }
+        }
         if (!urls.length) throw new Error("Experimental image edit returned no images");
         const selected = pickImageResults(urls, n);
 
@@ -1897,18 +2916,38 @@ openAiRoutes.post("/images/edits", async (c) => {
     }
 
     const calls = Math.ceil(n / 2);
-    const urlsNested = await mapLimit(Array.from({ length: calls }), 3, async () => {
-      return runImageCall({
-        requestModel: requestedModel,
+    const urlsNested = await mapLimit(
+      Array.from({ length: calls }),
+      resolveMediaConcurrency(settingsBundle, calls, 6),
+      async () =>
+        runImageCall({
+          requestModel: requestedModel,
+          prompt: imageCallPrompt("edit", prompt),
+          fileIds,
+          cookie,
+          settingsBundle,
+          settings: settingsBundle.grok,
+          responseFormat,
+          baseUrl,
+        }),
+    );
+    let urls = dedupeImages(urlsNested.flatMap((items) => finalImageValues(items)));
+    if (!hasSuccessfulImageResults(urls)) {
+      const recovered = await recoverImageResults({
+        env: c.env,
+        settingsBundle,
+        requestedModel,
         prompt: imageCallPrompt("edit", prompt),
         fileIds,
-        cookie,
-        settings: settingsBundle.grok,
         responseFormat,
         baseUrl,
+        desiredCount: n,
+        excludeTokens: [chosen.token],
       });
-    });
-    const urls = dedupeImages(urlsNested.flat().filter(Boolean));
+      if (hasSuccessfulImageResults(recovered)) {
+        urls = dedupeImages(recovered);
+      }
+    }
     const selected = pickImageResults(urls, n);
 
     await recordImageLog({

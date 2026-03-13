@@ -8,9 +8,16 @@ video_poster_preview = false
 timeout = 120
 base_proxy_url = ""
 asset_proxy_url = ""
+cf_cookies = ""
 cf_clearance = ""
+skip_proxy_ssl_verify = false
 max_retry = 3
 retry_status_codes = [401,429,403]
+reset_session_status_codes = [403]
+retry_backoff_base = 0.5
+retry_backoff_factor = 2.0
+retry_backoff_max = 20.0
+retry_budget = 60.0
 image_generation_method = "legacy"
 
 [app]
@@ -19,13 +26,17 @@ admin_username = "admin"
 app_key = "admin"
 api_key = ""
 image_format = "url"
-video_format = "url"
+video_format = "html"
+disable_memory = true
+custom_instruction = ""
 
 [token]
 auto_refresh = true
 refresh_interval_hours = 8
+super_refresh_interval_hours = 2
 fail_threshold = 5
 save_delay_ms = 500
+usage_flush_interval_sec = 5
 reload_interval_sec = 30
 nsfw_refresh_concurrency = 10
 nsfw_refresh_retries = 3
@@ -34,6 +45,23 @@ nsfw_refresh_retries = 3
 enable_auto_clean = true
 limit_mb = 1024
 keep_base64_cache = true
+
+[image]
+timeout = 60
+stream_timeout = 60
+final_timeout = 15
+blocked_grace_seconds = 10
+nsfw = true
+medium_min_bytes = 30000
+final_min_bytes = 100000
+blocked_parallel_attempts = 5
+blocked_parallel_enabled = true
+
+[video]
+concurrent = 100
+timeout = 60
+stream_timeout = 60
+upscale_timing = "complete"
 
 [performance]
 assets_max_concurrent = 25

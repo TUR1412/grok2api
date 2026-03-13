@@ -255,7 +255,9 @@ adminRoutes.get("/api/v1/admin/config", requireAdminAuth, async (c) => {
         app_key: settings.global.admin_password ?? "admin",
         app_url: settings.global.base_url ?? "",
         image_format: settings.global.image_mode ?? "url",
-        video_format: "url",
+        video_format: settings.global.video_format ?? "html",
+        disable_memory: Boolean(settings.global.disable_memory),
+        custom_instruction: String(settings.global.custom_instruction ?? ""),
       },
       grok: {
         temporary: Boolean(settings.grok.temporary),
@@ -267,9 +269,18 @@ adminRoutes.get("/api/v1/admin/config", requireAdminAuth, async (c) => {
         timeout: Number(settings.grok.stream_total_timeout ?? 600),
         base_proxy_url: String(settings.grok.proxy_url ?? ""),
         asset_proxy_url: String(settings.grok.cache_proxy_url ?? ""),
+        cf_cookies: String(settings.grok.cf_cookies ?? ""),
         cf_clearance: String(settings.grok.cf_clearance ?? ""),
-        max_retry: 3,
+        skip_proxy_ssl_verify: Boolean(settings.grok.skip_proxy_ssl_verify),
+        max_retry: Number(settings.grok.max_retry ?? 3),
         retry_status_codes: Array.isArray(settings.grok.retry_status_codes) ? settings.grok.retry_status_codes : [401, 429, 403],
+        reset_session_status_codes: Array.isArray(settings.grok.reset_session_status_codes)
+          ? settings.grok.reset_session_status_codes
+          : [403],
+        retry_backoff_base: Number(settings.grok.retry_backoff_base ?? 0.5),
+        retry_backoff_factor: Number(settings.grok.retry_backoff_factor ?? 2),
+        retry_backoff_max: Number(settings.grok.retry_backoff_max ?? 20),
+        retry_budget: Number(settings.grok.retry_budget ?? 60),
         image_generation_method: normalizeImageGenerationMethod(
           settings.grok.image_generation_method,
         ),
@@ -277,8 +288,10 @@ adminRoutes.get("/api/v1/admin/config", requireAdminAuth, async (c) => {
       token: {
         auto_refresh: Boolean(settings.token.auto_refresh),
         refresh_interval_hours: Number(settings.token.refresh_interval_hours ?? 8),
+        super_refresh_interval_hours: Number(settings.token.super_refresh_interval_hours ?? 2),
         fail_threshold: Number(settings.token.fail_threshold ?? 5),
         save_delay_ms: Number(settings.token.save_delay_ms ?? 500),
+        usage_flush_interval_sec: Number(settings.token.usage_flush_interval_sec ?? 5),
         reload_interval_sec: Number(settings.token.reload_interval_sec ?? 30),
       },
       cache: {
@@ -286,12 +299,44 @@ adminRoutes.get("/api/v1/admin/config", requireAdminAuth, async (c) => {
         limit_mb: Number(settings.cache.limit_mb ?? 1024),
         keep_base64_cache: Boolean(settings.cache.keep_base64_cache),
       },
+      image: {
+        timeout: Number(settings.image.timeout ?? 60),
+        stream_timeout: Number(settings.image.stream_timeout ?? 60),
+        final_timeout: Number(settings.image.final_timeout ?? 15),
+        blocked_grace_seconds: Number(settings.image.blocked_grace_seconds ?? 10),
+        nsfw: Boolean(settings.image.nsfw),
+        medium_min_bytes: Number(settings.image.medium_min_bytes ?? 30000),
+        final_min_bytes: Number(settings.image.final_min_bytes ?? 100000),
+        blocked_parallel_attempts: Number(settings.image.blocked_parallel_attempts ?? 5),
+        blocked_parallel_enabled: Boolean(settings.image.blocked_parallel_enabled),
+      },
+      video: {
+        concurrent: Number(settings.video.concurrent ?? 100),
+        timeout: Number(settings.video.timeout ?? 60),
+        stream_timeout: Number(settings.video.stream_timeout ?? 60),
+        upscale_timing: settings.video.upscale_timing ?? "complete",
+      },
       performance: {
         assets_max_concurrent: Number(settings.performance.assets_max_concurrent ?? 25),
         media_max_concurrent: Number(settings.performance.media_max_concurrent ?? 50),
         usage_max_concurrent: Number(settings.performance.usage_max_concurrent ?? 25),
         assets_delete_batch_size: Number(settings.performance.assets_delete_batch_size ?? 10),
         admin_assets_batch_size: Number(settings.performance.admin_assets_batch_size ?? 10),
+      },
+      register: {
+        worker_domain: settings.register.worker_domain ?? "",
+        email_domain: settings.register.email_domain ?? "",
+        admin_password: settings.register.admin_password ?? "",
+        yescaptcha_key: settings.register.yescaptcha_key ?? "",
+        solver_url: settings.register.solver_url ?? "",
+        solver_browser_type: settings.register.solver_browser_type ?? "camoufox",
+        solver_threads: Number(settings.register.solver_threads ?? 5),
+        register_threads: Number(settings.register.register_threads ?? 10),
+        default_count: Number(settings.register.default_count ?? 100),
+        auto_start_solver: Boolean(settings.register.auto_start_solver),
+        solver_debug: Boolean(settings.register.solver_debug),
+        max_errors: Number(settings.register.max_errors ?? 0),
+        max_runtime_minutes: Number(settings.register.max_runtime_minutes ?? 0),
       },
     });
   } catch (e) {
@@ -306,27 +351,39 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
     const grokCfg = (body && typeof body === "object" ? body.grok : null) as any;
     const tokenCfg = (body && typeof body === "object" ? body.token : null) as any;
     const cacheCfg = (body && typeof body === "object" ? body.cache : null) as any;
+    const imageCfg = (body && typeof body === "object" ? body.image : null) as any;
+    const videoCfg = (body && typeof body === "object" ? body.video : null) as any;
     const performanceCfg = (body && typeof body === "object" ? body.performance : null) as any;
 
     const global_config: any = {};
     const grok_config: any = {};
     const token_config: any = {};
     const cache_config: any = {};
+    const image_config: any = {};
+    const video_config: any = {};
     const performance_config: any = {};
+    const register_config: any = {};
 
     if (appCfg && typeof appCfg === "object") {
       if (typeof appCfg.api_key === "string") grok_config.api_key = appCfg.api_key.trim();
       if (typeof appCfg.admin_username === "string") global_config.admin_username = appCfg.admin_username.trim() || "admin";
       if (typeof appCfg.app_key === "string") global_config.admin_password = appCfg.app_key.trim() || "admin";
       if (typeof appCfg.app_url === "string") global_config.base_url = appCfg.app_url.trim();
+      if (appCfg.video_format === "html" || appCfg.video_format === "url") {
+        global_config.video_format = appCfg.video_format;
+      }
       if (appCfg.image_format === "url" || appCfg.image_format === "base64" || appCfg.image_format === "b64_json")
         global_config.image_mode = appCfg.image_format;
+      if (typeof appCfg.disable_memory === "boolean") global_config.disable_memory = appCfg.disable_memory;
+      if (typeof appCfg.custom_instruction === "string") global_config.custom_instruction = appCfg.custom_instruction;
     }
 
     if (grokCfg && typeof grokCfg === "object") {
       if (typeof grokCfg.base_proxy_url === "string") grok_config.proxy_url = grokCfg.base_proxy_url.trim();
       if (typeof grokCfg.asset_proxy_url === "string") grok_config.cache_proxy_url = grokCfg.asset_proxy_url.trim();
+      if (typeof grokCfg.cf_cookies === "string") grok_config.cf_cookies = grokCfg.cf_cookies.trim();
       if (typeof grokCfg.cf_clearance === "string") grok_config.cf_clearance = grokCfg.cf_clearance.trim();
+      if (typeof grokCfg.skip_proxy_ssl_verify === "boolean") grok_config.skip_proxy_ssl_verify = grokCfg.skip_proxy_ssl_verify;
       if (typeof grokCfg.filter_tags === "string") {
         grok_config.filtered_tags = grokCfg.filter_tags;
       } else if (Array.isArray(grokCfg.filter_tags)) {
@@ -336,8 +393,17 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
       if (typeof grokCfg.thinking === "boolean") grok_config.show_thinking = grokCfg.thinking;
       if (typeof grokCfg.temporary === "boolean") grok_config.temporary = grokCfg.temporary;
       if (typeof grokCfg.video_poster_preview === "boolean") grok_config.video_poster_preview = grokCfg.video_poster_preview;
+      if (Number.isFinite(Number(grokCfg.max_retry))) grok_config.max_retry = Math.max(1, Math.floor(Number(grokCfg.max_retry)));
       if (Array.isArray(grokCfg.retry_status_codes))
         grok_config.retry_status_codes = grokCfg.retry_status_codes.map((x: any) => Number(x)).filter((n: number) => Number.isFinite(n));
+      if (Array.isArray(grokCfg.reset_session_status_codes))
+        grok_config.reset_session_status_codes = grokCfg.reset_session_status_codes
+          .map((x: any) => Number(x))
+          .filter((n: number) => Number.isFinite(n));
+      if (Number.isFinite(Number(grokCfg.retry_backoff_base))) grok_config.retry_backoff_base = Math.max(0, Number(grokCfg.retry_backoff_base));
+      if (Number.isFinite(Number(grokCfg.retry_backoff_factor))) grok_config.retry_backoff_factor = Math.max(1, Number(grokCfg.retry_backoff_factor));
+      if (Number.isFinite(Number(grokCfg.retry_backoff_max))) grok_config.retry_backoff_max = Math.max(0, Number(grokCfg.retry_backoff_max));
+      if (Number.isFinite(Number(grokCfg.retry_budget))) grok_config.retry_budget = Math.max(0, Number(grokCfg.retry_budget));
       if (Number.isFinite(Number(grokCfg.timeout))) grok_config.stream_total_timeout = Math.max(1, Math.floor(Number(grokCfg.timeout)));
       if (typeof grokCfg.image_generation_method === "string" && grokCfg.image_generation_method.trim()) {
         grok_config.image_generation_method = normalizeImageGenerationMethod(
@@ -350,10 +416,14 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
       if (typeof tokenCfg.auto_refresh === "boolean") token_config.auto_refresh = tokenCfg.auto_refresh;
       if (Number.isFinite(Number(tokenCfg.refresh_interval_hours)))
         token_config.refresh_interval_hours = Math.max(1, Number(tokenCfg.refresh_interval_hours));
+      if (Number.isFinite(Number(tokenCfg.super_refresh_interval_hours)))
+        token_config.super_refresh_interval_hours = Math.max(1, Number(tokenCfg.super_refresh_interval_hours));
       if (Number.isFinite(Number(tokenCfg.fail_threshold)))
         token_config.fail_threshold = Math.max(1, Math.floor(Number(tokenCfg.fail_threshold)));
       if (Number.isFinite(Number(tokenCfg.save_delay_ms)))
         token_config.save_delay_ms = Math.max(0, Math.floor(Number(tokenCfg.save_delay_ms)));
+      if (Number.isFinite(Number(tokenCfg.usage_flush_interval_sec)))
+        token_config.usage_flush_interval_sec = Math.max(0, Math.floor(Number(tokenCfg.usage_flush_interval_sec)));
       if (Number.isFinite(Number(tokenCfg.reload_interval_sec)))
         token_config.reload_interval_sec = Math.max(0, Math.floor(Number(tokenCfg.reload_interval_sec)));
     }
@@ -362,6 +432,25 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
       if (typeof cacheCfg.enable_auto_clean === "boolean") cache_config.enable_auto_clean = cacheCfg.enable_auto_clean;
       if (Number.isFinite(Number(cacheCfg.limit_mb))) cache_config.limit_mb = Math.max(1, Math.floor(Number(cacheCfg.limit_mb)));
       if (typeof cacheCfg.keep_base64_cache === "boolean") cache_config.keep_base64_cache = cacheCfg.keep_base64_cache;
+    }
+
+    if (imageCfg && typeof imageCfg === "object") {
+      if (Number.isFinite(Number(imageCfg.timeout))) image_config.timeout = Math.max(1, Math.floor(Number(imageCfg.timeout)));
+      if (Number.isFinite(Number(imageCfg.stream_timeout))) image_config.stream_timeout = Math.max(1, Math.floor(Number(imageCfg.stream_timeout)));
+      if (Number.isFinite(Number(imageCfg.final_timeout))) image_config.final_timeout = Math.max(1, Number(imageCfg.final_timeout));
+      if (Number.isFinite(Number(imageCfg.blocked_grace_seconds))) image_config.blocked_grace_seconds = Math.max(1, Number(imageCfg.blocked_grace_seconds));
+      if (typeof imageCfg.nsfw === "boolean") image_config.nsfw = imageCfg.nsfw;
+      if (Number.isFinite(Number(imageCfg.medium_min_bytes))) image_config.medium_min_bytes = Math.max(1, Math.floor(Number(imageCfg.medium_min_bytes)));
+      if (Number.isFinite(Number(imageCfg.final_min_bytes))) image_config.final_min_bytes = Math.max(1, Math.floor(Number(imageCfg.final_min_bytes)));
+      if (Number.isFinite(Number(imageCfg.blocked_parallel_attempts))) image_config.blocked_parallel_attempts = Math.max(0, Math.floor(Number(imageCfg.blocked_parallel_attempts)));
+      if (typeof imageCfg.blocked_parallel_enabled === "boolean") image_config.blocked_parallel_enabled = imageCfg.blocked_parallel_enabled;
+    }
+
+    if (videoCfg && typeof videoCfg === "object") {
+      if (Number.isFinite(Number(videoCfg.concurrent))) video_config.concurrent = Math.max(1, Math.floor(Number(videoCfg.concurrent)));
+      if (Number.isFinite(Number(videoCfg.timeout))) video_config.timeout = Math.max(1, Math.floor(Number(videoCfg.timeout)));
+      if (Number.isFinite(Number(videoCfg.stream_timeout))) video_config.stream_timeout = Math.max(1, Math.floor(Number(videoCfg.stream_timeout)));
+      if (videoCfg.upscale_timing === "single" || videoCfg.upscale_timing === "complete") video_config.upscale_timing = videoCfg.upscale_timing;
     }
 
     if (performanceCfg && typeof performanceCfg === "object") {
@@ -377,7 +466,33 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
       }
     }
 
-    await saveSettings(c.env, { global_config, grok_config, token_config, cache_config, performance_config });
+    const registerCfg = (body && typeof body === "object" ? body.register : null) as any;
+    if (registerCfg && typeof registerCfg === "object") {
+      if (typeof registerCfg.worker_domain === "string") register_config.worker_domain = registerCfg.worker_domain.trim();
+      if (typeof registerCfg.email_domain === "string") register_config.email_domain = registerCfg.email_domain.trim();
+      if (typeof registerCfg.admin_password === "string") register_config.admin_password = registerCfg.admin_password.trim();
+      if (typeof registerCfg.yescaptcha_key === "string") register_config.yescaptcha_key = registerCfg.yescaptcha_key.trim();
+      if (typeof registerCfg.solver_url === "string") register_config.solver_url = registerCfg.solver_url.trim();
+      if (typeof registerCfg.solver_browser_type === "string") register_config.solver_browser_type = registerCfg.solver_browser_type.trim();
+      if (Number.isFinite(Number(registerCfg.solver_threads))) register_config.solver_threads = Math.max(1, Math.floor(Number(registerCfg.solver_threads)));
+      if (Number.isFinite(Number(registerCfg.register_threads))) register_config.register_threads = Math.max(1, Math.floor(Number(registerCfg.register_threads)));
+      if (Number.isFinite(Number(registerCfg.default_count))) register_config.default_count = Math.max(1, Math.floor(Number(registerCfg.default_count)));
+      if (typeof registerCfg.auto_start_solver === "boolean") register_config.auto_start_solver = registerCfg.auto_start_solver;
+      if (typeof registerCfg.solver_debug === "boolean") register_config.solver_debug = registerCfg.solver_debug;
+      if (Number.isFinite(Number(registerCfg.max_errors))) register_config.max_errors = Math.max(0, Math.floor(Number(registerCfg.max_errors)));
+      if (Number.isFinite(Number(registerCfg.max_runtime_minutes))) register_config.max_runtime_minutes = Math.max(0, Math.floor(Number(registerCfg.max_runtime_minutes)));
+    }
+
+    await saveSettings(c.env, {
+      global_config,
+      grok_config,
+      token_config,
+      cache_config,
+      image_config,
+      video_config,
+      performance_config,
+      register_config,
+    });
     return c.json(legacyOk({ message: "配置已更新" }));
   } catch (e) {
     return c.json(legacyErr(`Update config failed: ${e instanceof Error ? e.message : String(e)}`), 500);

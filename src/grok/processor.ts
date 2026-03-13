@@ -1,6 +1,8 @@
 import type { GrokSettings, GlobalSettings } from "../settings";
+import { parseToolCallBlock, parseToolCalls, type OpenAIToolCall } from "./toolCall";
 
 type GrokNdjson = Record<string, unknown>;
+type ChatFinishReason = "stop" | "error" | "tool_calls" | null;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -22,7 +24,7 @@ function makeChunk(
   created: number,
   model: string,
   content: string,
-  finish_reason?: "stop" | "error" | null,
+  finish_reason?: ChatFinishReason,
 ): string {
   const payload: Record<string, unknown> = {
     id,
@@ -33,6 +35,42 @@ function makeChunk(
       {
         index: 0,
         delta: content ? { role: "assistant", content } : {},
+        finish_reason: finish_reason ?? null,
+      },
+    ],
+  };
+  return `data: ${JSON.stringify(payload)}\n\n`;
+}
+
+function makeToolChunk(
+  id: string,
+  created: number,
+  model: string,
+  toolCall: OpenAIToolCall,
+  toolIndex: number,
+  finish_reason?: ChatFinishReason,
+): string {
+  const payload: Record<string, unknown> = {
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model,
+    choices: [
+      {
+        index: 0,
+        delta: {
+          tool_calls: [
+            {
+              index: toolIndex,
+              id: toolCall.id,
+              type: "function",
+              function: {
+                name: toolCall.function.name,
+                arguments: toolCall.function.arguments,
+              },
+            },
+          ],
+        },
         finish_reason: finish_reason ?? null,
       },
     ],
@@ -68,7 +106,13 @@ function buildVideoPosterPreview(videoUrl: string, posterUrl?: string): string {
 </a>\n`;
 }
 
-function buildVideoHtml(args: { videoUrl: string; posterUrl?: string; posterPreview: boolean }): string {
+function buildVideoHtml(args: {
+  videoUrl: string;
+  posterUrl?: string;
+  posterPreview: boolean;
+  videoFormat?: string | undefined;
+}): string {
+  if (args.videoFormat === "url") return `${args.videoUrl}\n`;
   if (args.posterPreview) return buildVideoPosterPreview(args.videoUrl, args.posterUrl);
   return buildVideoTag(args.videoUrl);
 }
@@ -114,6 +158,16 @@ function normalizeGeneratedAssetUrls(input: unknown): string[] {
   return out;
 }
 
+function longestSuffixPrefix(input: string, prefix: string): number {
+  const max = Math.min(input.length, prefix.length - 1);
+  for (let size = max; size > 0; size -= 1) {
+    if (input.slice(-size) === prefix.slice(0, size)) {
+      return size;
+    }
+  }
+  return 0;
+}
+
 export function createOpenAiStreamFromGrokNdjson(
   grokResp: Response,
   opts: {
@@ -122,6 +176,7 @@ export function createOpenAiStreamFromGrokNdjson(
     global: GlobalSettings;
     origin: string;
     requestedModel: string;
+    tools?: Array<Record<string, any>> | null | undefined;
     onFinish?: (result: { status: number; duration: number }) => Promise<void> | void;
   },
 ): ReadableStream<Uint8Array> {
@@ -168,6 +223,11 @@ export function createOpenAiStreamFromGrokNdjson(
       let thinkingFinished = false;
       let videoProgressStarted = false;
       let lastVideoProgress = -1;
+      let toolCallsSeen = false;
+      let toolCallIndex = 0;
+      let textBuffer = "";
+      let insideToolCall = false;
+      let toolBuffer = "";
 
       let buffer = "";
 
@@ -295,6 +355,7 @@ export function createOpenAiStreamFromGrokNdjson(
                       buildVideoHtml({
                         videoUrl: src,
                         posterPreview: settings.video_poster_preview === true,
+                        videoFormat: global.video_format,
                         ...(poster ? { posterUrl: poster } : {}),
                       }),
                     ),
@@ -377,12 +438,90 @@ export function createOpenAiStreamFromGrokNdjson(
               shouldSkip = true;
             }
 
-            if (!shouldSkip) controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, content)));
+            if (!shouldSkip) {
+              if (!Array.isArray(opts.tools) || !opts.tools.length) {
+                controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, content)));
+              } else {
+                textBuffer += content;
+
+                // Consume ordinary text until we hit a full or partial tool-call tag.
+                while (textBuffer) {
+                  if (insideToolCall) {
+                    const closeIdx = textBuffer.indexOf("</tool_call>");
+                    if (closeIdx === -1) {
+                      toolBuffer += textBuffer;
+                      textBuffer = "";
+                      break;
+                    }
+
+                    toolBuffer += textBuffer.slice(0, closeIdx);
+                    textBuffer = textBuffer.slice(closeIdx + "</tool_call>".length);
+                    const parsedToolCall = parseToolCallBlock(toolBuffer, opts.tools);
+                    if (parsedToolCall) {
+                      toolCallsSeen = true;
+                      controller.enqueue(
+                        encoder.encode(
+                          makeToolChunk(id, created, currentModel, parsedToolCall, toolCallIndex),
+                        ),
+                      );
+                      toolCallIndex += 1;
+                    } else {
+                      controller.enqueue(
+                        encoder.encode(
+                          makeChunk(
+                            id,
+                            created,
+                            currentModel,
+                            `<tool_call>${toolBuffer}</tool_call>`,
+                          ),
+                        ),
+                      );
+                    }
+                    toolBuffer = "";
+                    insideToolCall = false;
+                    continue;
+                  }
+
+                  const openIdx = textBuffer.indexOf("<tool_call>");
+                  if (openIdx === -1) {
+                    const holdLen = longestSuffixPrefix(textBuffer, "<tool_call>");
+                    const flushText = textBuffer.slice(0, textBuffer.length - holdLen);
+                    textBuffer = textBuffer.slice(textBuffer.length - holdLen);
+                    if (flushText) {
+                      controller.enqueue(
+                        encoder.encode(makeChunk(id, created, currentModel, flushText)),
+                      );
+                    }
+                    break;
+                  }
+
+                  const before = textBuffer.slice(0, openIdx);
+                  if (before) {
+                    controller.enqueue(
+                      encoder.encode(makeChunk(id, created, currentModel, before)),
+                    );
+                  }
+                  textBuffer = textBuffer.slice(openIdx + "<tool_call>".length);
+                  insideToolCall = true;
+                  toolBuffer = "";
+                }
+              }
+            }
             isThinking = currentIsThinking;
           }
         }
 
-        controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, "", "stop")));
+        if (insideToolCall && toolBuffer) {
+          controller.enqueue(
+            encoder.encode(makeChunk(id, created, currentModel, `<tool_call>${toolBuffer}`)),
+          );
+        } else if (textBuffer) {
+          controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, textBuffer)));
+        }
+
+        controller.enqueue(
+          encoder.encode(makeChunk(id, created, currentModel, "", toolCallsSeen ? "tool_calls" : "stop")),
+        );
         controller.enqueue(encoder.encode(makeDone()));
         if (opts.onFinish) await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000 });
         controller.close();
@@ -409,7 +548,14 @@ export function createOpenAiStreamFromGrokNdjson(
 
 export async function parseOpenAiFromGrokNdjson(
   grokResp: Response,
-  opts: { cookie: string; settings: GrokSettings; global: GlobalSettings; origin: string; requestedModel: string },
+  opts: {
+    cookie: string;
+    settings: GrokSettings;
+    global: GlobalSettings;
+    origin: string;
+    requestedModel: string;
+    tools?: Array<Record<string, any>> | null | undefined;
+  },
 ): Promise<Record<string, unknown>> {
   const { global, origin, requestedModel, settings } = opts;
   const text = await grokResp.text();
@@ -445,6 +591,7 @@ export async function parseOpenAiFromGrokNdjson(
       content = buildVideoHtml({
         videoUrl: src,
         posterPreview: settings.video_poster_preview === true,
+        videoFormat: global.video_format,
         ...(poster ? { posterUrl: poster } : {}),
       });
       model = requestedModel;
@@ -476,6 +623,10 @@ export async function parseOpenAiFromGrokNdjson(
     break;
   }
 
+  const parsedTools = parseToolCalls(content, opts.tools);
+  const finalContent = parsedTools.textContent;
+  const toolCalls = parsedTools.toolCalls;
+
   return {
     id: `chatcmpl-${crypto.randomUUID()}`,
     object: "chat.completion",
@@ -484,8 +635,12 @@ export async function parseOpenAiFromGrokNdjson(
     choices: [
       {
         index: 0,
-        message: { role: "assistant", content },
-        finish_reason: "stop",
+        message: {
+          role: "assistant",
+          content: finalContent,
+          ...(toolCalls ? { tool_calls: toolCalls } : {}),
+        },
+        finish_reason: toolCalls ? "tool_calls" : "stop",
       },
     ],
     usage: null,

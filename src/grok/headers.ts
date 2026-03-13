@@ -1,4 +1,4 @@
-import type { GrokSettings } from "../settings";
+import { normalizeCfCookie, type GrokSettings } from "../settings";
 
 const BASE_HEADERS: Record<string, string> = {
   Accept: "*/*",
@@ -45,9 +45,49 @@ export function getDynamicHeaders(settings: GrokSettings, pathname: string): Rec
   if (!dynamic && !statsigId) throw new Error("配置缺少 x_statsig_id（且未启用 dynamic_statsig）");
 
   const headers: Record<string, string> = { ...BASE_HEADERS };
+  const configuredUserAgent = String(settings.user_agent ?? "").trim();
+  if (configuredUserAgent) {
+    headers["User-Agent"] = configuredUserAgent;
+  }
   headers["x-statsig-id"] = statsigId;
   headers["x-xai-request-id"] = crypto.randomUUID();
   headers["Content-Type"] = pathname.includes("upload-file") ? "text/plain;charset=UTF-8" : "application/json";
   return headers;
+}
+
+export function buildAuthCookie(token: string, settings: GrokSettings): string {
+  const parts = [`sso-rw=${token}`, `sso=${token}`];
+  const cfCookies = String(settings.cf_cookies ?? "").trim();
+  const cfClearance = normalizeCfCookie(settings.cf_clearance ?? "");
+
+  if (cfCookies) {
+    const segments = cfCookies
+      .split(";")
+      .map((segment) => segment.trim())
+      .filter(Boolean);
+    let hasClearance = false;
+    for (const segment of segments) {
+      if (/^cf_clearance=/i.test(segment)) {
+        hasClearance = true;
+        if (cfClearance) {
+          parts.push(cfClearance);
+        } else {
+          parts.push(segment);
+        }
+      } else {
+        parts.push(segment);
+      }
+    }
+    if (!hasClearance && cfClearance) {
+      parts.push(cfClearance);
+    }
+    return parts.join(";");
+  }
+
+  if (cfClearance) {
+    parts.push(cfClearance);
+  }
+
+  return parts.join(";");
 }
 

@@ -1,8 +1,8 @@
 import { Hono } from "hono";
 import type { Env } from "../env";
-import { getSettings, normalizeCfCookie } from "../settings";
+import { getSettings } from "../settings";
 import { applyCooldown, recordTokenFailure, selectBestToken } from "../repo/tokens";
-import { getDynamicHeaders } from "../grok/headers";
+import { buildAuthCookie, getDynamicHeaders } from "../grok/headers";
 import { deleteCacheRow, touchCacheRow, upsertCacheRow, type CacheType } from "../repo/cache";
 import { nowMs } from "../utils/time";
 import { nextLocalMidnightExpirationSeconds } from "../kv/cleanup";
@@ -210,8 +210,7 @@ mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
   const chosen = await selectBestToken(c.env.DB, "grok-4");
   if (!chosen) return c.text("No available token", 503);
 
-  const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
-  const cookie = cf ? `sso-rw=${chosen.token};sso=${chosen.token};${cf}` : `sso-rw=${chosen.token};sso=${chosen.token}`;
+  const cookie = buildAuthCookie(chosen.token, settingsBundle.grok);
 
   const baseHeaders = toUpstreamHeaders({ pathname: originalPath, cookie, settings: settingsBundle.grok });
 

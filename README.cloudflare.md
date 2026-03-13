@@ -209,10 +209,13 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml config
 ## 8) 接口
 
 - POST /v1/chat/completions (supports stream: true)
+- POST /v1/responses (supports stream: true; bridges Responses API to the chat pipeline)
+- POST /v1/videos (OpenAI-compatible create endpoint for `grok-imagine-1.0-video`)
 - GET /v1/models (model set aligns with `readme.md`, including latest additions/removals)
 - GET /v1/images/method: returns current image-generation mode (legacy or imagine_ws_experimental) for /chat and /admin/chat UI switching
 - POST /v1/images/generations: experimental mode supports size (aspect-ratio mapping) and concurrency (1..3)
 - POST /v1/images/edits: only accepts grok-imagine-1.0-edit
+- Chat/Responses tool calling: supports `tools`, `tool_choice`, `parallel_tool_calls`, and emits OpenAI-compatible `tool_calls`
 - GET /images/<img_path>: reads from KV cache; on miss fetches assets.grok.com and writes back to KV (daily expiry/cleanup policy)
 - Note: Workers KV single-value size is limited (recommended <= 25MB); most video players use Range requests, which may bypass KV hits
 - Admin APIs: /api/*
