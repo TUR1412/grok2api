@@ -81,9 +81,9 @@ app.onError((err, c) => {
   return withResponseHeaders(res, { "x-grok2api-build": buildSha });
 });
 
+app.route("/", adminRoutes);
 app.route("/v1", openAiRoutes);
 app.route("/", mediaRoutes);
-app.route("/", adminRoutes);
 
 // Backward-compatible local-cache viewer URLs used by the multi-page admin UI.
 // In Workers we serve cache via /images/*, so redirect /v1/files/* to /images/*.
@@ -102,6 +102,13 @@ app.get("/login", (c) => {
   const buildSha = getBuildSha(c.env as Env);
   const v = c.req.query("v") ?? "";
   if (v !== buildSha) return c.redirect(`/login?v=${encodeURIComponent(buildSha)}`, 302);
+  return fetchAsset(c, "/login/login.html");
+});
+
+app.get("/admin/login", (c) => {
+  const buildSha = getBuildSha(c.env as Env);
+  const v = c.req.query("v") ?? "";
+  if (v !== buildSha) return c.redirect(`/admin/login?v=${encodeURIComponent(buildSha)}`, 302);
   return fetchAsset(c, "/login/login.html");
 });
 
